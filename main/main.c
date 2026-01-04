@@ -5,18 +5,24 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_chip_info.h"
-#include "esp_flash.h"
+// #include "esp_flash.h"
 #include "esp_system.h"
 #include "driver/gpio.h"
 #include "driver/i2c.h"
 #include "esp_log.h"
 #include <math.h>
 #include "driver/spi_master.h"
-
+#include "led_control.h"
+#include "ina260.h"
 // APA102 Like LED 
 #define LED_CLOCK 4
 #define LED_DATA_IN 5
 #define NUM_LEDS 1
+
+led_ctrl_t status_led = {
+    .clk_pin = LED_CLOCK,
+    .data_pin = LED_DATA_IN,
+};
 
 // Power Delivery TPS25730
 #define PD_POWER_ON 6
@@ -29,17 +35,6 @@
 // Heater Mosfet PWM
 #define HEATER_PWM 7
 
-// Power Monitor INA260AIPWR
-#define POWER_MONITOR_ADDRESS 0x40
-#define ALERT_INT 15
-#define INA260_REG_CONFIG      0x00
-#define INA260_REG_CURRENT     0x01  // 1.25 mA/LSB
-#define INA260_REG_VOLTAGE     0x02  // 1.25 mV/LSB
-#define INA260_REG_POWER       0x03  // 10 mW/LSB
-#define INA260_REG_MASK_EN     0x06
-#define INA260_REG_ALERT       0x07
-#define INA260_REG_MFG_ID      0xFE
-#define INA260_REG_DIE_ID      0xFF
 
 // I2C Pins
 #define SDA 18
@@ -559,87 +554,6 @@ static void max31865_print_status(void) {
     ESP_LOGI(TAG, "===========================");
 }
 
-// Read 16-bit register from INA260
-static esp_err_t ina260_read_reg(uint8_t reg, uint16_t *value) {
-    uint8_t data[2];
-    esp_err_t ret;
-    
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (POWER_MONITOR_ADDRESS << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (POWER_MONITOR_ADDRESS << 1) | I2C_MASTER_READ, true);
-    i2c_master_read_byte(cmd, &data[0], I2C_MASTER_ACK);
-    i2c_master_read_byte(cmd, &data[1], I2C_MASTER_NACK);
-    i2c_master_stop(cmd);
-    
-    ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    
-    if (ret == ESP_OK) {
-        *value = (data[0] << 8) | data[1];  // Big-endian
-    }
-    
-    return ret;
-}
-
-// Get bus voltage in millivolts
-static int32_t ina260_get_voltage_mv(void) {
-    uint16_t raw;
-    if (ina260_read_reg(INA260_REG_VOLTAGE, &raw) == ESP_OK) {
-        // 1.25 mV/LSB
-        return (int32_t)raw * 125 / 100;
-    }
-    return -1;
-}
-
-// Get current in milliamps (signed, can be negative)
-static int32_t ina260_get_current_ma(void) {
-    uint16_t raw;
-    if (ina260_read_reg(INA260_REG_CURRENT, &raw) == ESP_OK) {
-        // 1.25 mA/LSB, signed value
-        int16_t signed_raw = (int16_t)raw;
-        return (int32_t)signed_raw * 125 / 100;
-    }
-    return 0;
-}
-
-// Get power in milliwatts
-static int32_t ina260_get_power_mw(void) {
-    uint16_t raw;
-    if (ina260_read_reg(INA260_REG_POWER, &raw) == ESP_OK) {
-        // 10 mW/LSB
-        return (int32_t)raw * 10;
-    }
-    return -1;
-}
-
-// Print all INA260 readings
-static void ina260_print_status(void) {
-    int32_t voltage_mv = ina260_get_voltage_mv();
-    int32_t current_ma = ina260_get_current_ma();
-    int32_t power_mw = ina260_get_power_mw();
-    
-    ESP_LOGI(TAG, "=== INA260 Power Monitor ===");
-    
-    if (voltage_mv >= 0) {
-        ESP_LOGI(TAG, "Voltage: %ld mV (%.2fV)", voltage_mv, voltage_mv / 1000.0f);
-    } else {
-        ESP_LOGE(TAG, "Voltage: READ ERROR");
-    }
-    
-    ESP_LOGI(TAG, "Current: %ld mA (%.3fA)", current_ma, current_ma / 1000.0f);
-    
-    if (power_mw >= 0) {
-        ESP_LOGI(TAG, "Power: %ld mW (%.2fW)", power_mw, power_mw / 1000.0f);
-    } else {
-        ESP_LOGE(TAG, "Power: READ ERROR");
-    }
-    
-    ESP_LOGI(TAG, "============================");
-}
-
 
 
 
@@ -655,39 +569,7 @@ typedef struct {
     uint8_t supply_type;
 } pd_status_t;
 
-static void led_init(void) {
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << LED_CLOCK) | (1ULL << LED_DATA_IN),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
-    gpio_set_level(LED_CLOCK, 0);
-    gpio_set_level(LED_DATA_IN, 0);
-}
 
-static void led_send_byte(uint8_t byte) {
-    for (int i = 7; i >= 0; i--) {
-        gpio_set_level(LED_DATA_IN, (byte >> i) & 1);
-        gpio_set_level(LED_CLOCK, 1);
-        gpio_set_level(LED_CLOCK, 0);
-    }
-}
-
-static void led_set_color(uint8_t brightness, uint8_t r, uint8_t g, uint8_t b) {
-    for (int i = 0; i < 4; i++) {
-        led_send_byte(0x00);
-    }
-    led_send_byte(0xE0 | (brightness & 0x1F));
-    led_send_byte(b);
-    led_send_byte(g);
-    led_send_byte(r);
-    for (int i = 0; i < 4; i++) {
-        led_send_byte(0xFF);
-    }
-}
 
 void setupHeater(){
     gpio_config_t io_conf = {
@@ -908,31 +790,43 @@ static bool selftest(){
         success = false;
     }   
 
-    if(i2c_check_device(POWER_MONITOR_ADDRESS)){
-        ESP_LOGI(TAG, "Power Monitor OK at 0x%02X", POWER_MONITOR_ADDRESS);
-    } else {
-        ESP_LOGE(TAG, "Power Monitor MISSING at 0x%02X", POWER_MONITOR_ADDRESS);
-        success = false;
-    }
+    // if(i2c_check_device(POWER_MONITOR_ADDRESS)){
+    //     ESP_LOGI(TAG, "Power Monitor OK at 0x%02X", POWER_MONITOR_ADDRESS);
+    // } else {
+    //     ESP_LOGE(TAG, "Power Monitor MISSING at 0x%02X", POWER_MONITOR_ADDRESS);
+    //     success = false;
+    // }
 
     return success;
 }
 
+
+ina260_t power_monitor = {
+    .i2c_port = 0,
+    .i2c_addr = 0x40,
+    .alert_pin = 15, // or GPIO_NUM_NC
+};
+
+
 void app_main(void) {
-    led_init();
+    led_init(&status_led);
     setupHeater();
     i2c_master_init();
+    ina260_init(&power_monitor);
+
+    int32_t v, i, p;
+    
     max31865_init();
     i2c_scan();
     ads1220_init();
     if(!selftest()){
         while(1){
-            led_set_color(15, 255, 0, 0);
+            led_set_color(&status_led, 15, 255, 0, 0);
             vTaskDelay(100 / portTICK_PERIOD_MS);
-            led_set_color(15, 0, 0, 0);
+            led_set_color(&status_led, 15, 0, 0, 0);
             vTaskDelay(100 / portTICK_PERIOD_MS);
         }
-    }
+    }       
     
     // Wait for PD negotiation to complete
     vTaskDelay(500 / portTICK_PERIOD_MS);
@@ -941,17 +835,21 @@ void app_main(void) {
     pd_print_status();
     
     while (1) {
+        ina260_get_voltage_mv(&power_monitor, &v);
+    ina260_get_current_ma(&power_monitor, &i);
+    ina260_get_power_mw(&power_monitor, &p);
+
+        ESP_LOGI(TAG, "Power Monitor: Voltage=%dmV Current=%dmA Power=%dmW", v, i, p);
         // LED color based on voltage
         uint16_t voltage = pd_get_voltage_mv();
         max31865_print_status();
         
         if (voltage >= 15000) {
-            led_set_color(15, 0, 0, 255);   // Blue = 15V+
+            led_set_color(&status_led, 15, 0, 0, 255);   // Blue = 15V+
             // gpio_set_level(HEATER_PWM, 1);
             vTaskDelay(500 / portTICK_PERIOD_MS);
-            ina260_print_status();
         } else {
-            led_set_color(15, 255, 255, 0); // Yellow = unknown
+            led_set_color(&status_led, 15, 255, 255, 0); // Yellow = unknown
             pd_print_status();
         }
         
