@@ -5,20 +5,31 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_chip_info.h"
-// #include "esp_flash.h"
 #include "esp_system.h"
 #include "driver/gpio.h"
 #include "driver/i2c.h"
 #include "esp_log.h"
 #include <math.h>
 #include "driver/spi_master.h"
+#include "driver/ledc.h"
+#include "esp_timer.h"
+// User components
 #include "led_control.h"
 #include "ina260.h"
-// APA102 Like LED 
+#include "ads1220.h"
+#include "max31865.h"
+#include "pd.h"
+#include "stdatomic.h"
+#include "cJSON.h"
+#include "driver/usb_serial_jtag.h"
+#include "esp_vfs_usb_serial_jtag.h"
+
+static const char *TAG = "HEATER";
+
+// APA102 Like LED
 #define LED_CLOCK 4
 #define LED_DATA_IN 5
 #define NUM_LEDS 1
-
 led_ctrl_t status_led = {
     .clk_pin = LED_CLOCK,
     .data_pin = LED_DATA_IN,
@@ -29,12 +40,11 @@ led_ctrl_t status_led = {
 #define PD_ADDRESS 0x20
 
 // TPS25730 Register Addresses
-#define TPS25730_REG_ACTIVE_CONTRACT_PDO  0x34  // Length 6
-#define TPS25730_REG_ACTIVE_CONTRACT_RDO  0x35  // Length 4
+#define TPS25730_REG_ACTIVE_CONTRACT_PDO 0x34 // Length 6
+#define TPS25730_REG_ACTIVE_CONTRACT_RDO 0x35 // Length 4
 
 // Heater Mosfet PWM
 #define HEATER_PWM 7
-
 
 // I2C Pins
 #define SDA 18
@@ -42,548 +52,168 @@ led_ctrl_t status_led = {
 #define I2C_MASTER_NUM I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ 100000
 #define I2C_MASTER_TIMEOUT_MS 100
+static SemaphoreHandle_t i2c_bus_mutex = NULL;
 
 // SPI
 #define MOSI 22
 #define MISO 23
 #define SCK 21
+static SemaphoreHandle_t spi_bus_mutex = NULL;
 
-//MAX31865
+// MAX31865
 #define TEMP_CS 20
 #define TEMP_DATA_READY 3
 
-// MAX31865 Register Addresses (read: addr, write: addr | 0x80)
-#define MAX31865_REG_CONFIG      0x00
-#define MAX31865_REG_RTD_MSB     0x01
-#define MAX31865_REG_RTD_LSB     0x02
-#define MAX31865_REG_HFAULT_MSB  0x03
-#define MAX31865_REG_HFAULT_LSB  0x04
-#define MAX31865_REG_LFAULT_MSB  0x05
-#define MAX31865_REG_LFAULT_LSB  0x06
-#define MAX31865_REG_FAULT       0x07
+// =============================================================================
+// PID Controller Configuration
+// =============================================================================
+#define PID_MAX_DUTY_PERCENT    50.0f   // Maximum duty cycle percentage
+#define PID_MAX_DUTY            ((uint32_t)(255 * PID_MAX_DUTY_PERCENT / 100.0f))
+#define PID_MAX_TARGET_TEMP     50.0f   // Maximum allowed target temperature
+#define PID_MIN_TARGET_TEMP     20.0f   // Minimum target temperature
+#define PID_CONTROL_INTERVAL_MS 100     // PID update interval
+#define PID_INTEGRAL_MAX        100.0f  // Anti-windup limit
 
-// Configuration bits
-#define MAX31865_CONFIG_VBIAS    0x80
-#define MAX31865_CONFIG_AUTO     0x40
-#define MAX31865_CONFIG_1SHOT    0x20
-#define MAX31865_CONFIG_3WIRE    0x10
-#define MAX31865_CONFIG_FAULT_CLR 0x02
-#define MAX31865_CONFIG_50HZ     0x01  // 0 = 60Hz, 1 = 50Hz
+// Temperature control parameters (can be modified via serial)
+static float target_temperature = 25.0f;
+static float kp = 5.0f;
+static float ki = 0.1f;
+static float kd = 2.0f;
 
-// RTD Configuration - adjust these for your setup!
-#define RTD_RREF         430.0f    // Reference resistor (430 for PT100, 4300 for PT1000)
-#define RTD_NOMINAL      100.0f    // RTD nominal resistance at 0°C (100 for PT100, 1000 for PT1000)
+// PID state
+static float pid_integral = 0.0f;
+static float pid_prev_error = 0.0f;
+static int64_t pid_last_time_us = 0;
+static uint32_t pid_current_duty = 0;
+static atomic_bool heater_enabled = false;
+static atomic_bool pid_active = false;
 
-// Callendar-Van Dusen coefficients for PT100
-#define RTD_A  3.9083e-3f
-#define RTD_B -5.775e-7f
+// PWM mode flag - if false, use direct GPIO control for testing
+static bool use_pwm_mode = true;
+static bool ledc_initialized = false;
 
+// =============================================================================
+// Global state variables
+// =============================================================================
+atomic_int acnt;
 
+ina260_t power_monitor = {
+    .i2c_port = 0,
+    .i2c_addr = 0x40,
+    .alert_pin = 15, 
+};
 
-static spi_device_handle_t max31865_spi = NULL;
+ads1220_t loadcell = {
+    .spi_host = SPI2_HOST,
+    .cs_pin = 17,
+    .drdy_pin = 16,
+    .clock_hz = 1000000,
+};
 
+max31865_t rtd = {
+    .spi_host = SPI2_HOST,
+    .cs_pin = 20,
+    .rref = 430.0f,
+    .rtd_nominal = 100.0f,
+    .three_wire = false,
+    .clock_hz = 1000000,
+};
 
-static const char *TAG = "main";
+pd_t pd_device = {
+    .i2c_port = 0,
+    .i2c_addr = PD_ADDRESS,
+};
 
-// ============== ADS1220 24-bit ADC (Load Cell) ==============
+// Forward declaration
+static void send_response(const char *cmd, bool success, const char *message);
 
-// ADS1220 Commands
-#define ADS1220_CMD_RESET     0x06
-#define ADS1220_CMD_START     0x08
-#define ADS1220_CMD_POWERDOWN 0x02
-#define ADS1220_CMD_RDATA     0x10
-#define ADS1220_CMD_RREG      0x20
-#define ADS1220_CMD_WREG      0x40
-
-// ADS1220 Register Addresses
-#define ADS1220_REG0          0x00
-#define ADS1220_REG1          0x01
-#define ADS1220_REG2          0x02
-#define ADS1220_REG3          0x03
-
-// Register 0: Input MUX, Gain, PGA bypass
-#define ADS1220_MUX_AIN0_AIN1   (0x00 << 4)  // Differential AIN0-AIN1
-#define ADS1220_MUX_AIN2_AIN3   (0x03 << 4)  // Differential AIN2-AIN3
-#define ADS1220_MUX_AIN0_AVSS   (0x08 << 4)  // Single-ended AIN0
-#define ADS1220_MUX_AIN1_AVSS   (0x09 << 4)  // Single-ended AIN1
-#define ADS1220_GAIN_1          (0x00 << 1)
-#define ADS1220_GAIN_2          (0x01 << 1)
-#define ADS1220_GAIN_4          (0x02 << 1)
-#define ADS1220_GAIN_8          (0x03 << 1)
-#define ADS1220_GAIN_16         (0x04 << 1)
-#define ADS1220_GAIN_32         (0x05 << 1)
-#define ADS1220_GAIN_64         (0x06 << 1)
-#define ADS1220_GAIN_128        (0x07 << 1)
-#define ADS1220_PGA_BYPASS      0x01
-
-// Register 1: Data rate, Operating mode, Conversion mode, Temp sensor
-#define ADS1220_DR_20SPS        (0x00 << 5)
-#define ADS1220_DR_45SPS        (0x01 << 5)
-#define ADS1220_DR_90SPS        (0x02 << 5)
-#define ADS1220_DR_175SPS       (0x03 << 5)
-#define ADS1220_DR_330SPS       (0x04 << 5)
-#define ADS1220_DR_600SPS       (0x05 << 5)
-#define ADS1220_DR_1000SPS      (0x06 << 5)
-#define ADS1220_MODE_NORMAL     (0x00 << 3)
-#define ADS1220_MODE_DUTY       (0x01 << 3)
-#define ADS1220_MODE_TURBO      (0x02 << 3)
-#define ADS1220_CONV_SINGLE     (0x00 << 2)
-#define ADS1220_CONV_CONTINUOUS (0x01 << 2)
-#define ADS1220_TEMP_DISABLE    (0x00 << 1)
-#define ADS1220_TEMP_ENABLE     (0x01 << 1)
-
-// Register 2: Voltage reference, FIR filter, Power switch, IDAC
-#define ADS1220_VREF_INTERNAL   (0x00 << 6)  // 2.048V internal
-#define ADS1220_VREF_EXT_AIN    (0x01 << 6)  // External on AIN0/AIN3
-#define ADS1220_VREF_AVDD       (0x03 << 6)  // Analog supply
-#define ADS1220_FIR_NONE        (0x00 << 4)
-#define ADS1220_FIR_50_60       (0x01 << 4)
-#define ADS1220_FIR_50          (0x02 << 4)
-#define ADS1220_FIR_60          (0x03 << 4)
-#define ADS1220_PSW_OPEN        (0x00 << 3)
-#define ADS1220_PSW_AUTO        (0x01 << 3)
-#define ADS1220_IDAC_OFF        0x00
-#define ADS1220_IDAC_50UA       0x02
-#define ADS1220_IDAC_100UA      0x03
-#define ADS1220_IDAC_250UA      0x04
-#define ADS1220_IDAC_500UA      0x05
-#define ADS1220_IDAC_1000UA     0x06
-#define ADS1220_IDAC_1500UA     0x07
-
-// Register 3: IDAC routing, DRDY mode
-#define ADS1220_IDAC1_DISABLED  (0x00 << 5)
-#define ADS1220_IDAC1_AIN0      (0x01 << 5)
-#define ADS1220_IDAC1_AIN1      (0x02 << 5)
-#define ADS1220_IDAC2_DISABLED  (0x00 << 2)
-#define ADS1220_DRDY_ONLY       (0x00 << 1)
-//ADS1220IRVAR
-#define LOADCELL_DRDY 16
-#define LOADCELL_CS 17
-static spi_device_handle_t ads1220_spi = NULL;
-
-// Send command
-static esp_err_t ads1220_send_cmd(uint8_t cmd) {
-    spi_transaction_t t = {
-        .length = 8,
-        .tx_buffer = &cmd,
+void setupHeater()
+{
+    // First, reset the GPIO to a known state
+    gpio_reset_pin(HEATER_PWM);
+    
+    // Configure LEDC timer
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 100,  // Lower frequency for heater, easier to debug
+        .clk_cfg = LEDC_AUTO_CLK,
     };
-    return spi_device_transmit(ads1220_spi, &t);
-}
-
-// Write register
-static esp_err_t ads1220_write_reg(uint8_t reg, uint8_t value) {
-    uint8_t tx[2] = { ADS1220_CMD_WREG | (reg << 2), value };
-    
-    spi_transaction_t t = {
-        .length = 16,
-        .tx_buffer = tx,
-    };
-    
-    return spi_device_transmit(ads1220_spi, &t);
-}
-
-// Read register
-static esp_err_t ads1220_read_reg(uint8_t reg, uint8_t *value) {
-    uint8_t tx[2] = { ADS1220_CMD_RREG | (reg << 2), 0x00 };
-    uint8_t rx[2] = {0};
-    
-    spi_transaction_t t = {
-        .length = 16,
-        .tx_buffer = tx,
-        .rx_buffer = rx,
-    };
-    
-    esp_err_t ret = spi_device_transmit(ads1220_spi, &t);
-    if (ret == ESP_OK) {
-        *value = rx[1];
+    esp_err_t err = ledc_timer_config(&ledc_timer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "LEDC timer config failed: %s", esp_err_to_name(err));
+        return;
     }
-    return ret;
+    ESP_LOGI(TAG, "LEDC timer configured OK");
+    
+    // Configure LEDC channel
+    ledc_channel_config_t ledc_channel = {
+        .gpio_num = HEATER_PWM,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    err = ledc_channel_config(&ledc_channel);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "LEDC channel config failed: %s", esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI(TAG, "LEDC channel configured OK on GPIO %d", HEATER_PWM);
+    
+    ledc_initialized = true;
+    
+    // Start with 0 duty
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
-// Check if data is ready (DRDY pin low)
-static bool ads1220_data_ready(void) {
-    return gpio_get_level(LOADCELL_DRDY) == 0;
-}
-
-// Wait for data ready with timeout
-static bool ads1220_wait_drdy(uint32_t timeout_ms) {
-    uint32_t start = xTaskGetTickCount();
-    while (!ads1220_data_ready()) {
-        if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(timeout_ms)) {
-            return false;
+// Set heater duty cycle with safety limits
+static void heater_set_duty(uint32_t duty)
+{
+    // Clamp to maximum allowed duty cycle
+    if (duty > PID_MAX_DUTY) {
+        duty = PID_MAX_DUTY;
+    }
+    
+    pid_current_duty = duty;
+    
+    if (use_pwm_mode && ledc_initialized) {
+        esp_err_t err1 = ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+        esp_err_t err2 = ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+        if (err1 != ESP_OK || err2 != ESP_OK) {
+            ESP_LOGE(TAG, "LEDC set duty failed: %s / %s", 
+                     esp_err_to_name(err1), esp_err_to_name(err2));
         }
-        vTaskDelay(1);
     }
-    return true;
 }
 
-// Read 24-bit conversion data
-static esp_err_t ads1220_read_data(int32_t *data) {
-    uint8_t tx[4] = { ADS1220_CMD_RDATA, 0x00, 0x00, 0x00 };
-    uint8_t rx[4] = {0};
+// Turn off heater completely
+static void heater_off(void)
+{
+    pid_current_duty = 0;
     
-    spi_transaction_t t = {
-        .length = 32,
-        .tx_buffer = tx,
-        .rx_buffer = rx,
-    };
-    
-    esp_err_t ret = spi_device_transmit(ads1220_spi, &t);
-    if (ret == ESP_OK) {
-        // 24-bit signed value, MSB first
-        int32_t raw = ((int32_t)rx[1] << 16) | ((int32_t)rx[2] << 8) | rx[3];
-        
-        // Sign extend from 24-bit to 32-bit
-        if (raw & 0x800000) {
-            raw |= 0xFF000000;
-        }
-        
-        *data = raw;
+    if (use_pwm_mode && ledc_initialized) {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    } else {
+        gpio_set_level(HEATER_PWM, 0);
     }
-    return ret;
 }
 
-// Start single conversion
-static esp_err_t ads1220_start_conversion(void) {
-    return ads1220_send_cmd(ADS1220_CMD_START);
+// Reset PID state
+static void pid_reset(void)
+{
+    pid_integral = 0.0f;
+    pid_prev_error = 0.0f;
+    pid_last_time_us = esp_timer_get_time();
 }
 
-// Initialize ADS1220
-static esp_err_t ads1220_init(void) {
-    esp_err_t ret;
-    
-    // Configure DRDY pin as input
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << LOADCELL_DRDY),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
-    
-    // SPI device config (SPI bus already initialized by MAX31865)
-    spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 1000000,  // 1 MHz
-        .mode = 1,                   // SPI mode 1
-        .spics_io_num = LOADCELL_CS,
-        .queue_size = 1,
-        .cs_ena_pretrans = 1,
-        .cs_ena_posttrans = 1,
-    };
-    
-    ret = spi_bus_add_device(SPI2_HOST, &devcfg, &ads1220_spi);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "ADS1220 SPI add device failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    
-    // Reset the device
-    ads1220_send_cmd(ADS1220_CMD_RESET);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    
-    // Configure for load cell:
-    // Reg0: Differential AIN0-AIN1, Gain=128
-    ret = ads1220_write_reg(ADS1220_REG0, ADS1220_MUX_AIN0_AIN1 | ADS1220_GAIN_128);
-    if (ret != ESP_OK) return ret;
-    
-    // Reg1: 20 SPS (best noise), Normal mode, Continuous conversion
-    ret = ads1220_write_reg(ADS1220_REG1, ADS1220_DR_20SPS | ADS1220_MODE_NORMAL | ADS1220_CONV_CONTINUOUS);
-    if (ret != ESP_OK) return ret;
-    
-    // Reg2: Internal 2.048V reference, 50/60Hz rejection
-    ret = ads1220_write_reg(ADS1220_REG2, ADS1220_VREF_INTERNAL | ADS1220_FIR_50_60 | ADS1220_IDAC_OFF);
-    if (ret != ESP_OK) return ret;
-    
-    // Reg3: IDAC disabled, DRDY only on DOUT
-    ret = ads1220_write_reg(ADS1220_REG3, ADS1220_IDAC1_DISABLED | ADS1220_IDAC2_DISABLED | ADS1220_DRDY_ONLY);
-    if (ret != ESP_OK) return ret;
-    
-    // Start continuous conversion
-    ads1220_start_conversion();
-    
-    ESP_LOGI(TAG, "ADS1220 initialized");
-    return ESP_OK;
-}
-
-// Convert raw value to voltage (with internal 2.048V ref and gain)
-static float ads1220_raw_to_voltage(int32_t raw, uint8_t gain) {
-    // Full scale = 2.048V / gain
-    // Resolution = 2^23 = 8388608
-    float vref = 2.048f;
-    return ((float)raw * vref) / (8388608.0f * (float)gain);
-}
-
-// Get raw ADC reading
-static int32_t ads1220_get_raw(void) {
-    int32_t data = 0;
-    
-    if (!ads1220_wait_drdy(100)) {
-        ESP_LOGW(TAG, "ADS1220 DRDY timeout");
-        return 0;
-    }
-    
-    if (ads1220_read_data(&data) != ESP_OK) {
-        return 0;
-    }
-    
-    return data;
-}
-
-// Print ADS1220 status
-static void ads1220_print_status(void) {
-    int32_t raw;
-    float voltage;
-    
-    // ESP_LOGI(TAG, "=== ADS1220 Load Cell ADC ===");
-    
-    if (!ads1220_wait_drdy(100)) {
-        ESP_LOGE(TAG, "DRDY timeout - no data");
-        return;
-    }
-    
-    if (ads1220_read_data(&raw) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read data");
-        return;
-    }
-    
-    voltage = ads1220_raw_to_voltage(raw, 128);  // Using gain=128
-    
-    // ESP_LOGI(TAG, "Raw: %ld (0x%06lX)", raw, raw & 0xFFFFFF);
-    ESP_LOGI(TAG, "Voltage: %.6f V (%.3f mV)", voltage, voltage * 1000.0f);
-    
-    // For load cell, you'd convert voltage to weight here
-    // Weight = (voltage / excitation / sensitivity) * full_scale
-    // Example: 2mV/V sensitivity, 5V excitation, 10kg cell
-    // float weight_kg = (voltage / (0.002f * 5.0f)) * 10.0f;
-    
-    // ESP_LOGI(TAG, "=============================");
-}
-
-
-
-// Write single register
-static esp_err_t max31865_write_reg(uint8_t reg, uint8_t value) {
-    uint8_t tx[2] = { reg | 0x80, value };  // Set bit 7 for write
-    
-    spi_transaction_t t = {
-        .length = 16,
-        .tx_buffer = tx,
-    };
-    
-    return spi_device_transmit(max31865_spi, &t);
-}
-// Initialize SPI bus and MAX31865
-static esp_err_t max31865_init(void) {
-    esp_err_t ret;
-    
-    // SPI bus configuration
-    spi_bus_config_t buscfg = {
-        .mosi_io_num = MOSI,
-        .miso_io_num = MISO,
-        .sclk_io_num = SCK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 32,
-    };
-    
-    // Initialize SPI bus
-    ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {  // Already initialized is OK
-        ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    
-    // MAX31865 device configuration
-    spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 1000000,  // 1 MHz (MAX31865 supports up to 5MHz)
-        .mode = 1,                   // SPI mode 1 (CPOL=0, CPHA=1) or mode 3
-        .spics_io_num = TEMP_CS,
-        .queue_size = 1,
-        .cs_ena_pretrans = 1,
-        .cs_ena_posttrans = 1,
-    };
-    
-    ret = spi_bus_add_device(SPI2_HOST, &devcfg, &max31865_spi);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "SPI add device failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    
-    // Configure MAX31865: VBIAS on, auto conversion, 50Hz filter (for Europe)
-    uint8_t config = MAX31865_CONFIG_VBIAS | MAX31865_CONFIG_AUTO | MAX31865_CONFIG_50HZ;
-    // Add MAX31865_CONFIG_3WIRE if using 3-wire RTD
-    
-    ret = max31865_write_reg(MAX31865_REG_CONFIG, config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "MAX31865 config failed");
-        return ret;
-    }
-    
-    // Small delay for bias voltage to stabilize
-    vTaskDelay(pdMS_TO_TICKS(10));
-    
-    ESP_LOGI(TAG, "MAX31865 initialized");
-    return ESP_OK;
-}
-
-
-
-// Read single register
-static esp_err_t max31865_read_reg(uint8_t reg, uint8_t *value) {
-    uint8_t tx[2] = { reg & 0x7F, 0x00 };  // Clear bit 7 for read
-    uint8_t rx[2] = {0};
-    
-    spi_transaction_t t = {
-        .length = 16,
-        .tx_buffer = tx,
-        .rx_buffer = rx,
-    };
-    
-    esp_err_t ret = spi_device_transmit(max31865_spi, &t);
-    if (ret == ESP_OK) {
-        *value = rx[1];
-    }
-    return ret;
-}
-
-// Read 16-bit RTD value
-static esp_err_t max31865_read_rtd(uint16_t *rtd_raw) {
-    uint8_t tx[3] = { MAX31865_REG_RTD_MSB & 0x7F, 0x00, 0x00 };
-    uint8_t rx[3] = {0};
-    
-    spi_transaction_t t = {
-        .length = 24,
-        .tx_buffer = tx,
-        .rx_buffer = rx,
-    };
-    
-    esp_err_t ret = spi_device_transmit(max31865_spi, &t);
-    if (ret == ESP_OK) {
-        // Combine MSB and LSB, remove fault bit (bit 0)
-        *rtd_raw = ((rx[1] << 8) | rx[2]) >> 1;
-    }
-    return ret;
-}
-
-// Read fault status
-static uint8_t max31865_read_fault(void) {
-    uint8_t fault = 0;
-    max31865_read_reg(MAX31865_REG_FAULT, &fault);
-    return fault;
-}
-
-// Clear fault status
-static void max31865_clear_fault(void) {
-    uint8_t config;
-    max31865_read_reg(MAX31865_REG_CONFIG, &config);
-    config |= MAX31865_CONFIG_FAULT_CLR;
-    max31865_write_reg(MAX31865_REG_CONFIG, config);
-}
-
-// Convert RTD raw value to resistance
-static float max31865_rtd_to_resistance(uint16_t rtd_raw) {
-    return (float)rtd_raw * RTD_RREF / 32768.0f;
-}
-
-// Convert resistance to temperature using Callendar-Van Dusen equation
-// Simplified for positive temperatures (more accurate above 0°C)
-static float max31865_resistance_to_temp(float resistance) {
-    // For temperatures > 0°C:
-    // T = (-A + sqrt(A² - 4B(1 - R/R0))) / (2B)
-    
-    float Z1 = -RTD_A;
-    float Z2 = RTD_A * RTD_A - (4.0f * RTD_B);
-    float Z3 = (4.0f * RTD_B) / RTD_NOMINAL;
-    float Z4 = 2.0f * RTD_B;
-    
-    float temp = Z2 + (Z3 * resistance);
-    temp = (sqrtf(temp) + Z1) / Z4;
-    
-    // For more accurate negative temperatures, a different formula is needed
-    // or use a lookup table
-    
-    return temp;
-}
-
-// Get temperature in Celsius
-static float max31865_get_temperature(void) {
-    uint16_t rtd_raw;
-    
-    if (max31865_read_rtd(&rtd_raw) != ESP_OK) {
-        return -999.0f;  // Error value
-    }
-    
-    float resistance = max31865_rtd_to_resistance(rtd_raw);
-    float temp = max31865_resistance_to_temp(resistance);
-    
-    return temp;
-}
-
-// Print MAX31865 status
-static void max31865_print_status(void) {
-    uint16_t rtd_raw;
-    uint8_t fault;
-    
-    ESP_LOGI(TAG, "=== MAX31865 RTD Sensor ===");
-    
-    if (max31865_read_rtd(&rtd_raw) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read RTD");
-        return;
-    }
-    
-    float resistance = max31865_rtd_to_resistance(rtd_raw);
-    float temp = max31865_resistance_to_temp(resistance);
-    
-    ESP_LOGI(TAG, "RTD Raw: %u", rtd_raw);
-    ESP_LOGI(TAG, "Resistance: %.2f Ohm", resistance);
-    ESP_LOGI(TAG, "Temperature: %.2f °C", temp);
-    
-    fault = max31865_read_fault();
-    if (fault) {
-        ESP_LOGW(TAG, "Fault detected: 0x%02X", fault);
-        if (fault & 0x80) ESP_LOGW(TAG, "  - RTD High Threshold");
-        if (fault & 0x40) ESP_LOGW(TAG, "  - RTD Low Threshold");
-        if (fault & 0x20) ESP_LOGW(TAG, "  - REFIN- > 0.85 x VBIAS");
-        if (fault & 0x10) ESP_LOGW(TAG, "  - REFIN- < 0.85 x VBIAS (FORCE- open)");
-        if (fault & 0x08) ESP_LOGW(TAG, "  - RTDIN- < 0.85 x VBIAS (FORCE- open)");
-        if (fault & 0x04) ESP_LOGW(TAG, "  - Overvoltage/undervoltage");
-        max31865_clear_fault();
-    }
-    
-    ESP_LOGI(TAG, "===========================");
-}
-
-
-
-
-
-
-// PD Status structure
-typedef struct {
-    bool contract_valid;
-    bool capability_mismatch;
-    uint8_t object_position;
-    uint16_t voltage_mv;
-    uint16_t current_ma;
-    uint8_t supply_type;
-} pd_status_t;
-
-
-
-void setupHeater(){
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << HEATER_PWM),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
-    gpio_set_level(HEATER_PWM, 0);
-}
-
-static void i2c_master_init(void) {
+static void i2c_master_init(void)
+{
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = SDA,
@@ -596,265 +226,727 @@ static void i2c_master_init(void) {
     i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
 }
 
-static bool i2c_check_device(uint8_t address) {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (address << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(I2C_MASTER_TIMEOUT_MS));
-    i2c_cmd_link_delete(cmd);
-    return ret == ESP_OK;
+static void spi_init(void)
+{
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = MOSI,
+        .miso_io_num = MISO,
+        .sclk_io_num = SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 32,
+    };
+    ESP_ERROR_CHECK(
+        spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO)
+    );
 }
 
-static void i2c_scan(void) {
-    ESP_LOGI(TAG, "Scanning I2C bus...");
-    uint8_t count = 0;
-    for (uint8_t addr = 1; addr < 127; addr++) {
-        if (i2c_check_device(addr)) {
-            ESP_LOGI(TAG, "  Found device at 0x%02X", addr);
-            count++;
+// Temperature state
+static volatile float latest_temp = 0.0f;
+static atomic_bool temp_data_valid = false;
+static QueueHandle_t temp_ready_queue = NULL;
+
+// Loadcell state
+static volatile int32_t latest_loadcell_raw = 0;
+static atomic_bool loadcell_data_valid = false;
+static QueueHandle_t loadcell_ready_queue = NULL;
+
+// INA260 state
+static volatile int32_t latest_voltage_mv = 0;
+static volatile int32_t latest_current_ma = 0;
+static volatile int32_t latest_power_mw = 0;
+static atomic_bool ina260_data_valid = false;
+
+// PD state
+static volatile uint16_t latest_pd_voltage_mv = 0;
+static atomic_bool pd_data_valid = false;
+
+// JSON reporting mutex
+static SemaphoreHandle_t json_print_mutex = NULL;
+
+static void print_json(cJSON *json)
+{
+    if (json == NULL) return;
+    
+    char *json_str = cJSON_PrintUnformatted(json);
+    if (json_str != NULL)
+    {
+        if (xSemaphoreTake(json_print_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            printf("%s\n", json_str);
+            xSemaphoreGive(json_print_mutex);
+        }
+        cJSON_free(json_str);
+    }
+    cJSON_Delete(json);
+}
+
+static void report_temperature_json(float temp_c)
+{
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "type", "temperature");
+    cJSON_AddNumberToObject(json, "value", temp_c);
+    cJSON_AddStringToObject(json, "unit", "C");
+    cJSON_AddNumberToObject(json, "timestamp_ms", esp_timer_get_time() / 1000);
+    print_json(json);
+}
+
+static void report_loadcell_json(int32_t raw)
+{
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "type", "loadcell");
+    cJSON_AddNumberToObject(json, "raw", raw);
+    cJSON_AddNumberToObject(json, "timestamp_ms", esp_timer_get_time() / 1000);
+    print_json(json);
+}
+
+static void report_ina260_json(int32_t voltage_mv, int32_t current_ma, int32_t power_mw)
+{
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "type", "ina260");
+    cJSON_AddNumberToObject(json, "voltage_mv", voltage_mv);
+    cJSON_AddNumberToObject(json, "current_ma", current_ma);
+    cJSON_AddNumberToObject(json, "power_mw", power_mw);
+    cJSON_AddNumberToObject(json, "timestamp_ms", esp_timer_get_time() / 1000);
+    print_json(json);
+}
+
+static void report_pd_json(uint16_t voltage_mv)
+{
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "type", "pd");
+    cJSON_AddNumberToObject(json, "voltage_mv", voltage_mv);
+    cJSON_AddNumberToObject(json, "timestamp_ms", esp_timer_get_time() / 1000);
+    print_json(json);
+}
+
+static char temp_str[16];
+// static char duty_str[16];
+
+static void report_pid_status_json(void)
+{
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "type", "pid_status");
+    cJSON_AddBoolToObject(json, "enabled", atomic_load(&heater_enabled));
+    cJSON_AddBoolToObject(json, "active", atomic_load(&pid_active));
+    // cJSON_AddBoolToObject(json, "pwm_mode", use_pwm_mode);
+    // cJSON_AddBoolToObject(json, "ledc_init", ledc_initialized);
+    snprintf(temp_str, sizeof(temp_str), "%.2f", target_temperature);
+    cJSON_AddStringToObject(json, "target_temp", temp_str);
+
+    // Format current temperature to 2 decimal places
+    snprintf(temp_str, sizeof(temp_str), "%.2f", latest_temp);
+    cJSON_AddStringToObject(json, "current_tem22p", temp_str);
+    cJSON_AddNumberToObject(json, "duty", pid_current_duty);
+    cJSON_AddNumberToObject(json, "duty_percent", (pid_current_duty * 100.0f) / 255.0f);
+    cJSON_AddNumberToObject(json, "max_duty_percent", PID_MAX_DUTY_PERCENT);
+    // cJSON_AddNumberToObject(json, "kp", kp);
+    // cJSON_AddNumberToObject(json, "ki", ki);
+    // cJSON_AddNumberToObject(json, "kd", kd);
+    // cJSON_AddNumberToObject(json, "integral", pid_integral);
+    // cJSON_AddNumberToObject(json, "pd_voltage_mv", latest_pd_voltage_mv);
+    // INA
+    cJSON_AddNumberToObject(json, "voltage_mv", latest_voltage_mv);
+    cJSON_AddNumberToObject(json, "current_ma", latest_current_ma);
+    cJSON_AddNumberToObject(json, "power_mw", latest_power_mw);
+
+    // cJSON_AddNumberToObject(json, "timestamp_ms", esp_timer_get_time() / 1000);
+    print_json(json);
+}
+
+static void send_response(const char *cmd, bool success, const char *message)
+{
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "type", "response");
+    cJSON_AddStringToObject(json, "cmd", cmd);
+    cJSON_AddBoolToObject(json, "success", success);
+    if (message) {
+        cJSON_AddStringToObject(json, "message", message);
+    }
+    cJSON_AddNumberToObject(json, "timestamp_ms", esp_timer_get_time() / 1000);
+    print_json(json);
+}
+
+// ISR handlers
+static void IRAM_ATTR temp_ready_isr_handler(void* arg)
+{
+    uint32_t gpio_num = (uint32_t) arg;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    gpio_intr_disable(TEMP_DATA_READY);
+    xQueueSendFromISR(temp_ready_queue, &gpio_num, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+static void IRAM_ATTR loadcell_ready_isr_handler(void* arg)
+{
+    uint32_t gpio_num = (uint32_t) arg;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    gpio_intr_disable(loadcell.drdy_pin);
+    xQueueSendFromISR(loadcell_ready_queue, &gpio_num, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+void update_loadcell_state(void *arg)
+{
+    uint32_t gpio_num;
+    
+    while (1)
+    {
+        if (xQueueReceive(loadcell_ready_queue, &gpio_num, portMAX_DELAY))
+        {
+            if (xSemaphoreTake(spi_bus_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                int32_t raw;
+                esp_err_t err = ads1220_read_raw(&loadcell, &raw);
+                xSemaphoreGive(spi_bus_mutex);
+                
+                if (err == ESP_OK)
+                {
+                    latest_loadcell_raw = raw;
+                    atomic_store(&loadcell_data_valid, true);
+                }
+            }
+            gpio_intr_enable(loadcell.drdy_pin);
         }
     }
-    ESP_LOGI(TAG, "I2C scan complete. Found %d device(s)", count);
 }
 
-// Read TPS25730 register with retry logic
-static esp_err_t tps25730_read_register(uint8_t reg, uint8_t *data, uint8_t expected_len) {
-    uint8_t buffer[16];
-    esp_err_t ret;
-    uint8_t total = expected_len + 1;  // +1 for byte count
+void update_temp_state(void *arg)
+{
+    uint32_t gpio_num;
     
-    // Try up to 3 times
-    for (int attempt = 0; attempt < 3; attempt++) {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, (PD_ADDRESS << 1) | I2C_MASTER_WRITE, true);
-        i2c_master_write_byte(cmd, reg, true);
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, (PD_ADDRESS << 1) | I2C_MASTER_READ, true);
-        
-        for (int i = 0; i < total - 1; i++) {
-            i2c_master_read_byte(cmd, &buffer[i], I2C_MASTER_ACK);
+    while (1)
+    {
+        if (xQueueReceive(temp_ready_queue, &gpio_num, portMAX_DELAY))
+        {
+            if (xSemaphoreTake(spi_bus_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                float temp;
+                esp_err_t err = max31865_get_temperature(&rtd, &temp);
+                xSemaphoreGive(spi_bus_mutex);
+                
+                if (err == ESP_OK)
+                {
+                    latest_temp = temp;
+                    atomic_store(&temp_data_valid, true);
+                }
+            }
+            gpio_intr_enable(TEMP_DATA_READY);
         }
-        i2c_master_read_byte(cmd, &buffer[total - 1], I2C_MASTER_NACK);
-        i2c_master_stop(cmd);
+    }
+}
+
+void update_ina260_state(void *arg)
+{
+    TickType_t last_wake_time = xTaskGetTickCount();
+    
+    while (1)
+    {
+        if (xSemaphoreTake(i2c_bus_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+        {
+            int32_t v, i, p;
+            esp_err_t err_v = ina260_get_voltage_mv(&power_monitor, &v);
+            esp_err_t err_i = ina260_get_current_ma(&power_monitor, &i);
+            esp_err_t err_p = ina260_get_power_mw(&power_monitor, &p);
+            xSemaphoreGive(i2c_bus_mutex);
+            
+            if (err_v == ESP_OK && err_i == ESP_OK && err_p == ESP_OK)
+            {
+                latest_voltage_mv = v;
+                latest_current_ma = i;
+                latest_power_mw = p;
+                atomic_store(&ina260_data_valid, true);
+                // report_ina260_json(v, i, p);
+            }
+        }
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(100));
+    }
+}
+
+void update_pd_state(void *arg)
+{
+    TickType_t last_wake_time = xTaskGetTickCount();
+    
+    while (1)
+    {
+        if (xSemaphoreTake(i2c_bus_mutex, pdMS_TO_TICKS(50)) == pdTRUE)
+        {
+            uint16_t voltage = pd_get_voltage_mv(&pd_device);
+            xSemaphoreGive(i2c_bus_mutex);
+            
+            latest_pd_voltage_mv = voltage;
+            atomic_store(&pd_data_valid, true);
+            
+            if (voltage > 19000) {
+                led_set_color(&status_led, 255, 0, 255, 0);
+            }
+            else if (voltage > 6000) {   
+                led_set_color(&status_led, 255, 255, 255, 0);
+            }
+            else {
+                led_set_color(&status_led, 255, 255, 0, 0);
+            }
+        }
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(500));
+    }
+}
+
+// =============================================================================
+// PID Control Task
+// =============================================================================
+void pid_control_task(void *arg)
+{
+    TickType_t last_wake_time = xTaskGetTickCount();
+    pid_last_time_us = esp_timer_get_time();
+    
+    while (1)
+    {
+        bool should_run = atomic_load(&heater_enabled);
+        bool can_run = false;
         
-        ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(200));
-        i2c_cmd_link_delete(cmd);
-        
-        if (ret == ESP_OK) {
-            // Verify byte count matches expected
-            if (buffer[0] == expected_len || buffer[0] == 0) {
-                memcpy(data, &buffer[1], expected_len);
-                return ESP_OK;
+        if (should_run) {
+            if (latest_pd_voltage_mv < 12000) {
+                can_run = false;
+            }
+            else if (!atomic_load(&temp_data_valid)) {
+                can_run = false;
+            }
+            else if (latest_temp > 60.0f) {
+                can_run = false;
+            }
+            else {
+                can_run = true;
             }
         }
         
-        // Small delay before retry
-        vTaskDelay(pdMS_TO_TICKS(10));
+        atomic_store(&pid_active, can_run);
+        
+        if (can_run) {
+            int64_t now_us = esp_timer_get_time();
+            float dt = (now_us - pid_last_time_us) / 1000000.0f;
+            pid_last_time_us = now_us;
+            
+            if (dt < 0.001f) dt = 0.001f;
+            if (dt > 1.0f) dt = 1.0f;
+            
+            float current_temp = latest_temp;
+            float error = target_temperature - current_temp;
+            
+            float p_term = kp * error;
+            
+            pid_integral += error * dt;
+            if (pid_integral > PID_INTEGRAL_MAX) pid_integral = PID_INTEGRAL_MAX;
+            if (pid_integral < -PID_INTEGRAL_MAX) pid_integral = -PID_INTEGRAL_MAX;
+            float i_term = ki * pid_integral;
+            
+            float derivative = (error - pid_prev_error) / dt;
+            float d_term = kd * derivative;
+            pid_prev_error = error;
+            
+            float output = p_term + i_term + d_term;
+            
+            if (output < 0.0f) output = 0.0f;
+            if (output > (float)PID_MAX_DUTY) output = (float)PID_MAX_DUTY;
+            
+            heater_set_duty((uint32_t)output);
+        }
+        else {
+            heater_off();
+            if (!should_run) {
+                pid_reset();
+            }
+        }
+        
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(PID_CONTROL_INTERVAL_MS));
     }
-    
-    return ret;
 }
 
-// Read PD status with full parsing
-static esp_err_t pd_read_status(pd_status_t *status) {
-    uint8_t pdo_data[6] = {0};
-    uint8_t rdo_data[4] = {0};
-    esp_err_t ret;
-    
-    memset(status, 0, sizeof(pd_status_t));
-    
-    // Read ACTIVE_CONTRACT_PDO (6 bytes)
-    ret = tps25730_read_register(TPS25730_REG_ACTIVE_CONTRACT_PDO, pdo_data, 6);
-    
-    if (ret != ESP_OK) {
-        // No contract or read failed
-        status->contract_valid = false;
-        status->voltage_mv = 5000;  // Default 5V
-        return ret;
+// =============================================================================
+// Serial Command Processing
+// =============================================================================
+static void process_command_json(const char *cmd)
+{
+    cJSON *json = cJSON_Parse(cmd);
+    if (json == NULL) {
+        send_response("parse_error", false, "Invalid JSON");
+        return;
     }
     
-    // Parse PDO (bytes 0-3, little-endian)
-    uint32_t pdo = pdo_data[0] | (pdo_data[1] << 8) | (pdo_data[2] << 16) | (pdo_data[3] << 24);
-    
-    if (pdo == 0) {
-        status->contract_valid = false;
-        status->voltage_mv = 5000;
-        return ESP_OK;
+    cJSON *cmd_obj = cJSON_GetObjectItem(json, "cmd");
+    if (cmd_obj == NULL || !cJSON_IsString(cmd_obj)) {
+        send_response("unknown", false, "Missing 'cmd' field");
+        cJSON_Delete(json);
+        return;
     }
     
-    status->supply_type = (pdo >> 30) & 0x03;
+    const char *cmd_str = cmd_obj->valuestring;
     
-    switch (status->supply_type) {
-        case 0:  // Fixed Supply
-            status->voltage_mv = ((pdo >> 10) & 0x3FF) * 50;
-            status->current_ma = (pdo & 0x3FF) * 10;
-            break;
-        case 1:  // Variable Supply
-        case 2:  // Battery
-            status->voltage_mv = ((pdo >> 20) & 0x3FF) * 50;  // Max voltage
-            status->current_ma = (pdo & 0x3FF) * 10;
-            break;
-        case 3:  // APDO (PPS)
-            status->voltage_mv = ((pdo >> 17) & 0xFF) * 100;  // Max voltage
-            status->current_ma = (pdo & 0x7F) * 50;
-            break;
+    // -------------------------------------------------------------------------
+    // heater_on
+    // -------------------------------------------------------------------------
+    if (strcmp(cmd_str, "heater_on") == 0) {
+        pid_reset();
+        atomic_store(&heater_enabled, true);
+        send_response(cmd_str, true, "Heater enabled");
     }
-    
-    status->contract_valid = (status->voltage_mv > 0);
-    
-    // Read ACTIVE_CONTRACT_RDO (4 bytes)
-    ret = tps25730_read_register(TPS25730_REG_ACTIVE_CONTRACT_RDO, rdo_data, 4);
-    
-    if (ret == ESP_OK) {
-        uint32_t rdo = rdo_data[0] | (rdo_data[1] << 8) | (rdo_data[2] << 16) | (rdo_data[3] << 24);
+    // -------------------------------------------------------------------------
+    // heater_off
+    // -------------------------------------------------------------------------
+    else if (strcmp(cmd_str, "heater_off") == 0) {
+        atomic_store(&heater_enabled, false);
+        heater_off();
+        send_response(cmd_str, true, "Heater disabled");
+    }
+    // -------------------------------------------------------------------------
+    // gpio_test - Direct GPIO test (bypasses LEDC entirely)
+    // Usage: {"cmd": "gpio_test", "state": 1, "duration_ms": 500}
+    // -------------------------------------------------------------------------
+    else if (strcmp(cmd_str, "gpio_test") == 0) {
+        cJSON *state = cJSON_GetObjectItem(json, "state");
+        cJSON *duration = cJSON_GetObjectItem(json, "duration_ms");
         
-        if (rdo != 0) {
-            status->object_position = (rdo >> 28) & 0x07;
-            status->capability_mismatch = (rdo >> 26) & 0x01;
-            // RDO current overrides PDO current (actual negotiated)
-            uint16_t rdo_current = ((rdo >> 10) & 0x3FF) * 10;
-            if (rdo_current > 0) {
-                status->current_ma = rdo_current;
+        int gpio_state = (state && cJSON_IsNumber(state)) ? (int)state->valuedouble : 1;
+        int dur_ms = (duration && cJSON_IsNumber(duration)) ? (int)duration->valuedouble : 500;
+        
+        // Temporarily disable LEDC on this pin
+        ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+        
+        // Configure as plain GPIO
+        gpio_reset_pin(HEATER_PWM);
+        gpio_set_direction(HEATER_PWM, GPIO_MODE_OUTPUT);
+        gpio_set_level(HEATER_PWM, gpio_state);
+        
+        send_response(cmd_str, true, gpio_state ? "GPIO HIGH" : "GPIO LOW");
+        
+        if (dur_ms > 0 && gpio_state) {
+            vTaskDelay(pdMS_TO_TICKS(dur_ms));
+            gpio_set_level(HEATER_PWM, 0);
+            
+            // Re-init LEDC
+            setupHeater();
+            
+            cJSON *resp = cJSON_CreateObject();
+            cJSON_AddStringToObject(resp, "type", "gpio_test_done");
+            cJSON_AddNumberToObject(resp, "duration_ms", dur_ms);
+            print_json(resp);
+        }
+    }
+    // -------------------------------------------------------------------------
+    // pwm_test - Test LEDC PWM directly with specific duty
+    // Usage: {"cmd": "pwm_test", "duty": 128}
+    // -------------------------------------------------------------------------
+    else if (strcmp(cmd_str, "pwm_test") == 0) {
+        cJSON *duty_val = cJSON_GetObjectItem(json, "duty");
+        uint32_t duty = (duty_val && cJSON_IsNumber(duty_val)) ? (uint32_t)duty_val->valuedouble : 128;
+        
+        if (duty > 255) duty = 255;
+        
+        esp_err_t err1 = ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+        esp_err_t err2 = ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+        
+        // Also read back the duty to verify
+        uint32_t read_duty = ledc_get_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+        
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddStringToObject(resp, "type", "response");
+        cJSON_AddStringToObject(resp, "cmd", cmd_str);
+        cJSON_AddBoolToObject(resp, "success", (err1 == ESP_OK && err2 == ESP_OK));
+        cJSON_AddNumberToObject(resp, "duty_set", duty);
+        cJSON_AddNumberToObject(resp, "duty_read", read_duty);
+        cJSON_AddStringToObject(resp, "err1", esp_err_to_name(err1));
+        cJSON_AddStringToObject(resp, "err2", esp_err_to_name(err2));
+        cJSON_AddBoolToObject(resp, "ledc_init", ledc_initialized);
+        print_json(resp);
+    }
+    // -------------------------------------------------------------------------
+    // reinit_ledc - Reinitialize LEDC
+    // -------------------------------------------------------------------------
+    else if (strcmp(cmd_str, "reinit_ledc") == 0) {
+        ledc_initialized = false;
+        setupHeater();
+        send_response(cmd_str, ledc_initialized, ledc_initialized ? "LEDC reinitialized" : "LEDC init failed");
+    }
+    // -------------------------------------------------------------------------
+    // set_temp
+    // -------------------------------------------------------------------------
+    else if (strcmp(cmd_str, "set_temp") == 0) {
+        cJSON *val = cJSON_GetObjectItem(json, "value");
+        if (val && cJSON_IsNumber(val)) {
+            float new_temp = (float)val->valuedouble;
+            if (new_temp < PID_MIN_TARGET_TEMP) {
+                send_response(cmd_str, false, "Temperature below minimum (20C)");
+            }
+            else if (new_temp > PID_MAX_TARGET_TEMP) {
+                send_response(cmd_str, false, "Temperature above maximum (50C)");
+            }
+            else {
+                target_temperature = new_temp;
+                pid_integral = 0.0f;
+                send_response(cmd_str, true, "Target temperature set");
+            }
+        }
+        else {
+            send_response(cmd_str, false, "Missing or invalid 'value'");
+        }
+    }
+    // -------------------------------------------------------------------------
+    // set_kp
+    // -------------------------------------------------------------------------
+    else if (strcmp(cmd_str, "set_kp") == 0) {
+        cJSON *val = cJSON_GetObjectItem(json, "value");
+        if (val && cJSON_IsNumber(val)) {
+            float new_kp = (float)val->valuedouble;
+            if (new_kp >= 0.0f) {
+                kp = new_kp;
+                send_response(cmd_str, true, "Kp set");
+            }
+            else {
+                send_response(cmd_str, false, "Kp must be >= 0");
+            }
+        }
+        else {
+            send_response(cmd_str, false, "Missing or invalid 'value'");
+        }
+    }
+    // -------------------------------------------------------------------------
+    // set_ki
+    // -------------------------------------------------------------------------
+    else if (strcmp(cmd_str, "set_ki") == 0) {
+        cJSON *val = cJSON_GetObjectItem(json, "value");
+        if (val && cJSON_IsNumber(val)) {
+            float new_ki = (float)val->valuedouble;
+            if (new_ki >= 0.0f) {
+                ki = new_ki;
+                pid_integral = 0.0f;
+                send_response(cmd_str, true, "Ki set");
+            }
+            else {
+                send_response(cmd_str, false, "Ki must be >= 0");
+            }
+        }
+        else {
+            send_response(cmd_str, false, "Missing or invalid 'value'");
+        }
+    }
+    // -------------------------------------------------------------------------
+    // set_kd
+    // -------------------------------------------------------------------------
+    else if (strcmp(cmd_str, "set_kd") == 0) {
+        cJSON *val = cJSON_GetObjectItem(json, "value");
+        if (val && cJSON_IsNumber(val)) {
+            float new_kd = (float)val->valuedouble;
+            if (new_kd >= 0.0f) {
+                kd = new_kd;
+                send_response(cmd_str, true, "Kd set");
+            }
+            else {
+                send_response(cmd_str, false, "Kd must be >= 0");
+            }
+        }
+        else {
+            send_response(cmd_str, false, "Missing or invalid 'value'");
+        }
+    }
+    // -------------------------------------------------------------------------
+    // set_pid
+    // -------------------------------------------------------------------------
+    else if (strcmp(cmd_str, "set_pid") == 0) {
+        cJSON *val_kp = cJSON_GetObjectItem(json, "kp");
+        cJSON *val_ki = cJSON_GetObjectItem(json, "ki");
+        cJSON *val_kd = cJSON_GetObjectItem(json, "kd");
+        
+        bool valid = true;
+        float new_kp = kp, new_ki = ki, new_kd = kd;
+        
+        if (val_kp && cJSON_IsNumber(val_kp)) {
+            new_kp = (float)val_kp->valuedouble;
+            if (new_kp < 0.0f) valid = false;
+        }
+        if (val_ki && cJSON_IsNumber(val_ki)) {
+            new_ki = (float)val_ki->valuedouble;
+            if (new_ki < 0.0f) valid = false;
+        }
+        if (val_kd && cJSON_IsNumber(val_kd)) {
+            new_kd = (float)val_kd->valuedouble;
+            if (new_kd < 0.0f) valid = false;
+        }
+        
+        if (valid) {
+            kp = new_kp;
+            ki = new_ki;
+            kd = new_kd;
+            pid_integral = 0.0f;
+            send_response(cmd_str, true, "PID gains set");
+        }
+        else {
+            send_response(cmd_str, false, "Invalid PID values (must be >= 0)");
+        }
+    }
+    // -------------------------------------------------------------------------
+    // get_status
+    // -------------------------------------------------------------------------
+    else if (strcmp(cmd_str, "get_status") == 0) {
+        report_pid_status_json();
+    }
+    // -------------------------------------------------------------------------
+    // reset_pid
+    // -------------------------------------------------------------------------
+    else if (strcmp(cmd_str, "reset_pid") == 0) {
+        pid_reset();
+        send_response(cmd_str, true, "PID state reset");
+    }
+    // -------------------------------------------------------------------------
+    // set_duty - Manual PWM duty
+    // -------------------------------------------------------------------------
+    else if (strcmp(cmd_str, "set_duty") == 0) {
+        cJSON *val = cJSON_GetObjectItem(json, "value");
+        if (val && cJSON_IsNumber(val)) {
+            uint32_t duty = (uint32_t)val->valuedouble;
+            if (duty > PID_MAX_DUTY) {
+                duty = PID_MAX_DUTY;
+            }
+            heater_set_duty(duty);
+            
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Duty set to %lu (%.1f%%)", 
+                     (unsigned long)duty, (duty * 100.0f) / 255.0f);
+            send_response(cmd_str, true, msg);
+        }
+        else {
+            send_response(cmd_str, false, "Missing or invalid 'value'");
+        }
+    }
+    // -------------------------------------------------------------------------
+    // Unknown
+    // -------------------------------------------------------------------------
+    else {
+        send_response(cmd_str, false, "Unknown command");
+    }
+    
+    cJSON_Delete(json);
+}
+
+static void usb_serial_init(void)
+{
+    usb_serial_jtag_driver_config_t cfg = {
+        .rx_buffer_size = 256,
+        .tx_buffer_size = 256,
+    };
+    usb_serial_jtag_driver_install(&cfg);
+}
+
+static void command_task(void *arg)
+{
+    char buf[256];
+    int idx = 0;
+    
+    while (1)
+    {
+        uint8_t byte;
+        int len = usb_serial_jtag_read_bytes(&byte, 1, pdMS_TO_TICKS(100));
+        
+        if (len > 0)
+        {
+            if (byte == '\n' || byte == '\r')
+            {
+                if (idx > 0)
+                {
+                    buf[idx] = '\0';
+                    process_command_json(buf);
+                    idx = 0;
+                }
+            }
+            else if (idx < sizeof(buf) - 1)
+            {
+                buf[idx++] = byte;
             }
         }
     }
-    
-    return ESP_OK;
 }
 
-// Get voltage in millivolts
-static uint16_t pd_get_voltage_mv(void) {
-    pd_status_t status;
-    if (pd_read_status(&status) == ESP_OK) {
-        return status.voltage_mv;
+void status_report_task(void *arg)
+{
+    TickType_t last_wake_time = xTaskGetTickCount();
+    
+    while (1)
+    {
+        report_pid_status_json();
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(1000));
     }
-    return 5000;  // Default
 }
 
-// Check if PD contract is active
-static bool pd_is_contract_active(void) {
-    pd_status_t status;
-    if (pd_read_status(&status) == ESP_OK) {
-        return status.contract_valid;
-    }
-    return false;
-}
-
-// Print PD status
-static void pd_print_status(void) {
-    pd_status_t status;
+void setup()
+{
+    usb_serial_init();
+    i2c_bus_mutex = xSemaphoreCreateMutex();
+    spi_bus_mutex = xSemaphoreCreateMutex();
+    json_print_mutex = xSemaphoreCreateMutex();
     
-    if (pd_read_status(&status) != ESP_OK) {
-        ESP_LOGW(TAG, "PD read failed, retrying...");
-        vTaskDelay(pdMS_TO_TICKS(100));
-        if (pd_read_status(&status) != ESP_OK) {
-            ESP_LOGE(TAG, "PD status unavailable");
-            return;
-        }
-    }
-    
-    ESP_LOGI(TAG, "=== USB PD Status ===");
-    
-    if (status.contract_valid) {
-        const char *types[] = {"Fixed", "Variable", "Battery", "PPS"};
-        ESP_LOGI(TAG, "Contract: ACTIVE");
-        ESP_LOGI(TAG, "Type: %s Supply", types[status.supply_type & 0x03]);
-        ESP_LOGI(TAG, "Voltage: %d mV (%.1fV)", status.voltage_mv, status.voltage_mv / 1000.0f);
-        ESP_LOGI(TAG, "Current: %d mA (%.1fA)", status.current_ma, status.current_ma / 1000.0f);
-        ESP_LOGI(TAG, "Power: %.1fW", (status.voltage_mv / 1000.0f) * (status.current_ma / 1000.0f));
-        
-        if (status.object_position > 0) {
-            ESP_LOGI(TAG, "PDO Position: %d", status.object_position);
-        }
-        if (status.capability_mismatch) {
-            ESP_LOGW(TAG, "Capability Mismatch!");
-        }
-    } else {
-        ESP_LOGI(TAG, "Contract: NONE");
-        ESP_LOGI(TAG, "Defaulting to 5V USB");
-    }
-    
-    ESP_LOGI(TAG, "=====================");
-}
-
-static bool selftest(){
-    bool success = true;
-    ESP_LOGI(TAG, "Starting self-test...");
-
-    if(i2c_check_device(PD_ADDRESS)){
-        ESP_LOGI(TAG, "PD Controller OK at 0x%02X", PD_ADDRESS);
-    } else {
-        ESP_LOGE(TAG, "PD Controller MISSING at 0x%02X", PD_ADDRESS);
-        success = false;
-    }   
-
-    // if(i2c_check_device(POWER_MONITOR_ADDRESS)){
-    //     ESP_LOGI(TAG, "Power Monitor OK at 0x%02X", POWER_MONITOR_ADDRESS);
-    // } else {
-    //     ESP_LOGE(TAG, "Power Monitor MISSING at 0x%02X", POWER_MONITOR_ADDRESS);
-    //     success = false;
-    // }
-
-    return success;
-}
-
-
-ina260_t power_monitor = {
-    .i2c_port = 0,
-    .i2c_addr = 0x40,
-    .alert_pin = 15, // or GPIO_NUM_NC
-};
-
-
-void app_main(void) {
     led_init(&status_led);
     setupHeater();
     i2c_master_init();
+    spi_init();
+    
+    pd_init(&pd_device);
     ina260_init(&power_monitor);
+    max31865_init(&rtd);
+    ads1220_init(&loadcell);
+    
+    gpio_config_t temp_io_conf = {
+        .pin_bit_mask = (1ULL << TEMP_DATA_READY),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_LOW_LEVEL,
+    };
+    gpio_config(&temp_io_conf);
+    gpio_intr_disable(TEMP_DATA_READY);
+    
+    gpio_config_t loadcell_io_conf = {
+        .pin_bit_mask = (1ULL << loadcell.drdy_pin),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_LOW_LEVEL,
+    };
+    gpio_config(&loadcell_io_conf);
+    gpio_intr_disable(loadcell.drdy_pin);
+    
+    float temp;
+    max31865_get_temperature(&rtd, &temp);
+    
+    int32_t raw;
+    ads1220_read_raw(&loadcell, &raw);
+    
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    
+    temp_ready_queue = xQueueCreate(10, sizeof(uint32_t));
+    loadcell_ready_queue = xQueueCreate(10, sizeof(uint32_t));
+    
+    xTaskCreate(update_temp_state, "temp_update", 4096, NULL, 10, NULL);
+    xTaskCreate(update_loadcell_state, "loadcell_update", 4096, NULL, 10, NULL);
+    xTaskCreate(update_ina260_state, "ina260_update", 4096, NULL, 5, NULL);
+    xTaskCreate(update_pd_state, "pd_update", 4096, NULL, 5, NULL);
+    xTaskCreate(command_task, "command_task", 4096, NULL, 1, NULL);
+    xTaskCreate(pid_control_task, "pid_control", 4096, NULL, 8, NULL);
+    xTaskCreate(status_report_task, "status_report", 4096, NULL, 2, NULL);
+    
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(TEMP_DATA_READY, temp_ready_isr_handler, (void*) TEMP_DATA_READY);
+    gpio_isr_handler_add(loadcell.drdy_pin, loadcell_ready_isr_handler, (void*) loadcell.drdy_pin);
+    
+    gpio_intr_enable(TEMP_DATA_READY);
+    gpio_intr_enable(loadcell.drdy_pin);
+    
+    ESP_LOGI(TAG, "Setup complete, LEDC initialized: %d", ledc_initialized);
+}
 
-    int32_t v, i, p;
+void app_main(void)
+{
+    setup();
     
-    max31865_init();
-    i2c_scan();
-    ads1220_init();
-    if(!selftest()){
-        while(1){
-            led_set_color(&status_led, 15, 255, 0, 0);
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-            led_set_color(&status_led, 15, 0, 0, 0);
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-        }
-    }       
-    
-    // Wait for PD negotiation to complete
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-    
-    // Print initial status
-    pd_print_status();
-    
-    while (1) {
-        ina260_get_voltage_mv(&power_monitor, &v);
-    ina260_get_current_ma(&power_monitor, &i);
-    ina260_get_power_mw(&power_monitor, &p);
-
-        ESP_LOGI(TAG, "Power Monitor: Voltage=%dmV Current=%dmA Power=%dmW", v, i, p);
-        // LED color based on voltage
-        uint16_t voltage = pd_get_voltage_mv();
-        max31865_print_status();
-        
-        if (voltage >= 15000) {
-            led_set_color(&status_led, 15, 0, 0, 255);   // Blue = 15V+
-            // gpio_set_level(HEATER_PWM, 1);
-            vTaskDelay(500 / portTICK_PERIOD_MS);
-        } else {
-            led_set_color(&status_led, 15, 255, 255, 0); // Yellow = unknown
-            pd_print_status();
-        }
-        
-        
-        
-        // ads1220_print_status();
+    while (1)
+    {
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
 }
