@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include "driver/i2c.h"
 #include "esp_err.h"
+#include "cJSON.h"
 
 typedef struct {
     bool contract_valid;
@@ -26,3 +27,4 @@ esp_err_t pd_read_status(pd_t *pd, pd_status_t *status);
 uint16_t pd_get_voltage_mv(pd_t *pd);
 bool pd_is_contract_active(pd_t *pd);
 void pd_print_status(pd_t *pd);
+cJSON * report_pd_json(uint16_t voltage_mv);

@@ -1,6 +1,8 @@
 #include "ads1220.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
+#include "cJSON.h"
 
 /* Commands */
 #define ADS1220_CMD_RESET     0x06
@@ -131,4 +133,11 @@ esp_err_t ads1220_init(ads1220_t *dev)
 
     dev->gain = 128;
     return ESP_OK;
+}
+
+cJSON *report_loadcell_json(int32_t raw)
+{
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddNumberToObject(json, "loadcell", raw);
+    return json;
 }

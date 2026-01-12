@@ -2,6 +2,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <math.h>
+#include "esp_timer.h"
+#include "cJSON.h"
 
 /* Registers */
 #define MAX31865_REG_CONFIG     0x00
@@ -144,4 +146,11 @@ esp_err_t max31865_init(max31865_t *dev)
 
     vTaskDelay(pdMS_TO_TICKS(10));
     return ESP_OK;
+}
+
+cJSON * report_temperature_json(float temp_c)
+{
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddNumberToObject(json, "temperature", temp_c);
+    return json;
 }

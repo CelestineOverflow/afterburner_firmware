@@ -3,6 +3,8 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include <string.h>
+#include "cJSON.h"
+#include "esp_timer.h"
 
 // TPS25730 Registers
 #define TPS25730_REG_ACTIVE_CONTRACT_PDO 0x34
@@ -215,4 +217,11 @@ void pd_print_status(pd_t *pd)
         ESP_LOGI(TAG, "Contract: NONE (default 5V)");
     }
     ESP_LOGI(TAG, "=====================");
+}
+
+cJSON * report_pd_json(uint16_t voltage_mv)
+{
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddNumberToObject(json, "pd_voltage_mv", voltage_mv);
+    return json;
 }

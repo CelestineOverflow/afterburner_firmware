@@ -4,6 +4,7 @@
 #include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
+#include "cJSON.h"
 
 typedef struct {
     i2c_port_t i2c_port;
@@ -18,3 +19,4 @@ esp_err_t ina260_init(ina260_t *dev);
 esp_err_t ina260_get_voltage_mv(ina260_t *dev, int32_t *mv);
 esp_err_t ina260_get_current_ma(ina260_t *dev, int32_t *ma);
 esp_err_t ina260_get_power_mw(ina260_t *dev, int32_t *mw);
+cJSON * report_ina260_json(int32_t voltage_mv, int32_t current_ma, int32_t power_mw);

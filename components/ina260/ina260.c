@@ -1,5 +1,5 @@
 #include "ina260.h"
-
+#include "cJSON.h"
 /* Registers */
 #define INA260_REG_CONFIG   0x00
 #define INA260_REG_CURRENT  0x01  // 1.25 mA/LSB
@@ -93,4 +93,14 @@ esp_err_t ina260_get_power_mw(ina260_t *dev, int32_t *mw)
         *mw = (int32_t)raw * 10; // 10 mW/LSB
     }
     return ret;
+}
+
+
+cJSON * report_ina260_json(int32_t voltage_mv, int32_t current_ma, int32_t power_mw)
+{
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddNumberToObject(json, "voltage_mv", voltage_mv);
+    cJSON_AddNumberToObject(json, "current_ma", current_ma);
+    cJSON_AddNumberToObject(json, "power_mw", power_mw);
+    return json;
 }

@@ -4,6 +4,7 @@
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
+#include "cJSON.h"
 
 typedef struct {
     spi_host_device_t spi_host;
@@ -30,3 +31,4 @@ esp_err_t max31865_read_rtd_raw(max31865_t *dev, uint16_t *rtd);
 /* Fault handling */
 uint8_t max31865_read_fault(max31865_t *dev);
 void max31865_clear_fault(max31865_t *dev);
+cJSON * report_temperature_json(float temp_c);
