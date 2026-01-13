@@ -31,8 +31,11 @@ jobs:
         cp build/partition_table/partition-table.bin release/
         cp build/test.bin release/afterburner-firmware.bin
         
+        # Install esptool
+        pip install esptool
+        
         # Create merged binary (single file with everything)
-        python -m esptool --chip esp32c6 merge_bin \
+        esptool.py --chip esp32c6 merge_bin \
           -o release/afterburner-firmware-full.bin \
           --flash_mode dio --flash_size 2MB --flash_freq 80m \
           0x0 build/bootloader/bootloader.bin \
@@ -80,5 +83,7 @@ jobs:
             0x8000 partition-table.bin \
             0x10000 afterburner-firmware.bin
           ```
+          
+          Or use the provided `flash.sh` or `flash-merged.sh` scripts.
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
