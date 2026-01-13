@@ -69,14 +69,18 @@ pid_controller_t pid_c = {
     .pwm_pin = HEATER_PWM,
     .speed_mode = LEDC_LOW_SPEED_MODE,
     .duty_resolution = LEDC_TIMER_8_BIT,
+    .timer_num = LEDC_TIMER_0,     
     .ledc_channel = LEDC_CHANNEL_0,
     .ledc_clk_cfg = LEDC_AUTO_CLK,
     .frequency = 100,
+    .max_duty = 64,
+    .enabled = false,
 };
 
 
 // Temperature state
-static volatile float latest_temp = 0.0f;
+static volatile float current_temperature = 0.0f;
+static volatile float target_temperature = 0.0f;
 static atomic_bool temp_data_valid = false;
 static QueueHandle_t temp_ready_queue = NULL;
 
@@ -115,6 +119,14 @@ static void print_json(cJSON *json)
     cJSON_Delete(json);
 }
 
+static void report_error_json(const char *message)
+{
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "type", "error");
+    cJSON_AddStringToObject(json, "message", message);;
+    print_json(json);
+}
+
 static void send_response(const char *cmd, bool success, const char *message)
 {
     cJSON *json = cJSON_CreateObject();
@@ -136,14 +148,45 @@ static void process_command_json(const char *cmd)
         return;
     }
     
-    cJSON *cmd_obj = cJSON_GetObjectItem(json, "cmd");
-    if (cmd_obj == NULL || !cJSON_IsString(cmd_obj)) {
-        send_response("unknown", false, "Missing 'cmd' field");
+    // Command list
+    // { "type": "set_target_temperature", "value": float }
+    // { "type": "enable_heater", "value": bool }
+    
+    cJSON *type_item = cJSON_GetObjectItem(json, "type");
+    if (type_item == NULL || type_item->type != cJSON_String) {
+        send_response("invalid_command", false, "Missing or invalid 'type' field");
         cJSON_Delete(json);
         return;
     }
-    else {
-        send_response("unknown", false, "Unknown command");
+    
+    const char *type_str = type_item->valuestring;
+    
+    if (strcmp(type_str, "set_target_temperature") == 0) {
+        cJSON *value_item = cJSON_GetObjectItem(json, "value");
+        if (value_item != NULL && value_item->type == cJSON_Number) {
+            target_temperature = (float)value_item->valuedouble;
+            send_response("set_target_temperature", true, "Target temperature set");
+        } else {
+            send_response("set_target_temperature", false, "Invalid 'value' field");
+        }
+    } else if (strcmp(type_str, "enable_heater") == 0) {
+        cJSON *value_item = cJSON_GetObjectItem(json, "value");
+        if (value_item != NULL && value_item->type == cJSON_True) {
+            // Check if we have valid temperature data before enabling
+            if (atomic_load(&temp_data_valid)) {
+                pid_set_enabled(&pid_c, true);
+                send_response("enable_heater", true, "Heater enabled");
+            } else {
+                report_error_json("No valid temperature data");
+            }
+        } else if (value_item != NULL && value_item->type == cJSON_False) {
+            pid_set_enabled(&pid_c, false);
+            send_response("enable_heater", true, "Heater disabled");
+        } else {
+            send_response("enable_heater", false, "Invalid 'value' field");
+        }
+    } else {
+        report_error_json("Unknown command type");
     }
     
     cJSON_Delete(json);
@@ -226,9 +269,20 @@ void update_temp_state(void *arg)
                 
                 if (err == ESP_OK)
                 {
-                    latest_temp = temp;
+                    current_temperature = temp;
                     atomic_store(&temp_data_valid, true);
                     print_json(report_temperature_json(temp));
+                    // if the temperature exceeds target by more than 20c or is out of range disable the heater
+                    if ((pid_c.enabled) && (temp > target_temperature + 20.0f || temp < -200.0f || temp > 200.0f)) {
+                        pid_set_enabled(&pid_c, false);
+                        report_error_json("Temperature out of range - heater disabled");
+                    }
+                    pid_update(&pid_c, target_temperature, current_temperature);
+                    cJSON *json = cJSON_CreateObject();
+                    cJSON_AddStringToObject(json, "type", "pid_status");
+                    cJSON_AddNumberToObject(json, "target_temperature", target_temperature);
+                    cJSON_AddBoolToObject(json, "heater_enabled", pid_c.enabled);
+                    print_json(json);
                 }
             }
             gpio_intr_enable(TEMP_DATA_READY);
@@ -282,6 +336,11 @@ static void update_ina260_state(void *arg)
                 latest_current_ma = i;
                 latest_power_mw = p;
                 atomic_store(&ina260_data_valid, true);
+                // if the voltage is below 15000 mV we disable the heater
+                if (pid_c.enabled && v < 15000) {
+                    pid_set_enabled(&pid_c, false);
+                    report_error_json("INA260 voltage low - heater disabled");
+                }
                 print_json(report_ina260_json(v, i, p));
             }
         }
@@ -347,24 +406,15 @@ static void command_task(void *arg)
     }
 }
 
-
-// static void update_pid_controller(void *arg)
-// {
-//     TickType_t last_wake_time = xTaskGetTickCount();
-    
-//     while (1)
-//     {
-//         if (atomic_load(&temp_data_valid))
-//         {
-//             float output = pid_compute(&pid_c, setpoint, latest_temp, last_time_delta);
-//             pid_set_output(&pid_c, output);
-//         }
-//         vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(100));
-//     }
-// }
+static const char *TAG = "main";
 
 void setup()
 {
+    ESP_LOGI(TAG, "Firmware Version: %s", FW_VERSION);
+    ESP_LOGI(TAG, "Version: %d.%d.%d", 
+            FW_VERSION_MAJOR, 
+            FW_VERSION_MINOR, 
+            FW_VERSION_PATCH);
     pid_init(&pid_c);
     usb_serial_init();
     i2c_bus_mutex = xSemaphoreCreateMutex();
