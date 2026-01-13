@@ -410,6 +410,7 @@ static const char *TAG = "main";
 
 void setup()
 {
+    ESP_LOGI(TAG, "Starting Afterburner Firmware");
     ESP_LOGI(TAG, "Firmware Version: %s", FW_VERSION);
     ESP_LOGI(TAG, "Version: %d.%d.%d", 
             FW_VERSION_MAJOR, 
