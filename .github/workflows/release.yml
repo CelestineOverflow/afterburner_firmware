@@ -1,0 +1,84 @@
+name: Build and Release Firmware
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+    
+    - name: ESP-IDF Build
+      uses: espressif/esp-idf-ci-action@v1
+      with:
+        esp_idf_version: v5.5.1
+        target: esp32c6
+        path: '.'
+    
+    - name: Prepare release artifacts
+      run: |
+        mkdir -p release
+        
+        # Copy individual binaries
+        cp build/bootloader/bootloader.bin release/
+        cp build/partition_table/partition-table.bin release/
+        cp build/test.bin release/afterburner-firmware.bin
+        
+        # Create merged binary (single file with everything)
+        python -m esptool --chip esp32c6 merge_bin \
+          -o release/afterburner-firmware-full.bin \
+          --flash_mode dio --flash_size 2MB --flash_freq 80m \
+          0x0 build/bootloader/bootloader.bin \
+          0x8000 build/partition_table/partition-table.bin \
+          0x10000 build/test.bin
+        
+        # Create flash script for individual binaries
+        cat > release/flash.sh << 'EOF'
+        #!/bin/bash
+        esptool.py --chip esp32c6 -b 460800 \
+          --before default_reset --after hard_reset \
+          write_flash --flash_mode dio --flash_size 2MB --flash_freq 80m \
+          0x0 bootloader.bin \
+          0x8000 partition-table.bin \
+          0x10000 afterburner-firmware.bin
+        EOF
+        chmod +x release/flash.sh
+        
+        # Create flash script for merged binary
+        cat > release/flash-merged.sh << 'EOF'
+        #!/bin/bash
+        esptool.py --chip esp32c6 -b 460800 \
+          --before default_reset --after hard_reset \
+          write_flash --flash_mode dio --flash_size 2MB --flash_freq 80m \
+          0x0 afterburner-firmware-full.bin
+        EOF
+        chmod +x release/flash-merged.sh
+        
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: release/*
+        body: |
+          ## Afterburner Firmware ${{ github.ref_name }}
+          
+          ### Option 1: Flash merged binary (easiest)
+          ```bash
+          esptool.py --chip esp32c6 -b 460800 write_flash --flash_mode dio --flash_size 2MB --flash_freq 80m 0x0 afterburner-firmware-full.bin
+          ```
+          
+          ### Option 2: Flash individual binaries
+          ```bash
+          esptool.py --chip esp32c6 -b 460800 write_flash --flash_mode dio --flash_size 2MB --flash_freq 80m \
+            0x0 bootloader.bin \
+            0x8000 partition-table.bin \
+            0x10000 afterburner-firmware.bin
+          ```
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
