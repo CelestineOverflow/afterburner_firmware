@@ -13,7 +13,7 @@ typedef struct {
     int pwm_pin;
     ledc_mode_t speed_mode;
     ledc_timer_bit_t duty_resolution;
-    ledc_timer_t timer_num;        // ← ADD THIS
+    ledc_timer_t timer_num;        
     ledc_channel_t ledc_channel;
     ledc_clk_cfg_t ledc_clk_cfg;
     uint32_t frequency;

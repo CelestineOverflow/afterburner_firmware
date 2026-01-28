@@ -73,7 +73,7 @@ pid_controller_t pid_c = {
     .ledc_channel = LEDC_CHANNEL_0,
     .ledc_clk_cfg = LEDC_AUTO_CLK,
     .frequency = 100,
-    .max_duty = 64,
+    .max_duty = 255,
     .enabled = false,
 };
 
@@ -410,12 +410,6 @@ static const char *TAG = "main";
 
 void setup()
 {
-    ESP_LOGI(TAG, "Starting Afterburner Firmware");
-    ESP_LOGI(TAG, "Firmware Version: %s", FW_VERSION);
-    ESP_LOGI(TAG, "Version: %d.%d.%d", 
-            FW_VERSION_MAJOR, 
-            FW_VERSION_MINOR, 
-            FW_VERSION_PATCH);
     pid_init(&pid_c);
     usb_serial_init();
     i2c_bus_mutex = xSemaphoreCreateMutex();
