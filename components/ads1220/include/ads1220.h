@@ -24,4 +24,4 @@ esp_err_t ads1220_read_raw(ads1220_t *dev, int32_t *raw);
 
 /* Convert raw value to voltage */
 float ads1220_raw_to_voltage(ads1220_t *dev, int32_t raw);
-cJSON * report_loadcell_json(int32_t raw);
+cJSON * report_loadcell_json(int32_t raw, int32_t zero, float multiplier);

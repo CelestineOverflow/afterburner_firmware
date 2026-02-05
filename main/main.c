@@ -13,6 +13,8 @@
 #include "driver/spi_master.h"
 #include "driver/ledc.h"
 #include "esp_timer.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 // User components
 #include "led_control.h"
 #include "ina260.h"
@@ -25,6 +27,8 @@
 #include "esp_vfs_usb_serial_jtag.h"
 #include "pid.h"
 #include "board.h"
+// #include "esp_littlefs.h"
+
 
 static SemaphoreHandle_t i2c_bus_mutex = NULL;
 static SemaphoreHandle_t spi_bus_mutex = NULL;
@@ -86,6 +90,8 @@ static QueueHandle_t temp_ready_queue = NULL;
 
 // Loadcell state
 static volatile int32_t latest_loadcell_raw = 0;
+static volatile int32_t loadcell_zero = 0;
+static volatile float  loadcell_multiplier = 1.0f;
 static atomic_bool loadcell_data_valid = false;
 static QueueHandle_t loadcell_ready_queue = NULL;
 
@@ -101,6 +107,90 @@ static atomic_bool pd_data_valid = false;
 
 // JSON reporting mutex
 static SemaphoreHandle_t json_print_mutex = NULL;
+
+esp_err_t nvs_write_integer(const char *key, int value) {
+   nvs_handle_t handle;
+   esp_err_t err;
+   err = nvs_open("storage", NVS_READWRITE, &handle);
+   if (err != ESP_OK) {
+       printf("Error opening NVS: %s", esp_err_to_name(err));
+       return err;
+   }
+   err = nvs_set_blob(handle, key, &value, sizeof(int));
+   if (err != ESP_OK) {
+       printf("Error writing float: %s", esp_err_to_name(err));
+       nvs_close(handle);
+       return err;
+   }
+   err = nvs_commit(handle);
+   if (err != ESP_OK) {
+       printf("Error committing: %s", esp_err_to_name(err));
+   }
+   nvs_close(handle);
+   return err;
+}
+
+int nvs_read_integer(const char *key, int default_value) {
+   nvs_handle_t handle;
+   esp_err_t err;
+   float value = default_value;
+   err = nvs_open("storage", NVS_READONLY, &handle);
+   if (err != ESP_OK) {
+       printf("Error opening NVS: %s", esp_err_to_name(err));
+       return default_value;
+   }
+   size_t required_size = sizeof(int);
+   err = nvs_get_blob(handle, key, &value, &required_size);
+   if (err == ESP_ERR_NVS_NOT_FOUND) {
+       printf( "Key '%s' not found, using default", key);
+   } else if (err != ESP_OK) {
+       printf( "Error reading float: %s", esp_err_to_name(err));
+   }
+   nvs_close(handle);
+   return value;
+}
+
+esp_err_t nvs_write_float(const char *key, float value) {
+   nvs_handle_t handle;
+   esp_err_t err;
+   err = nvs_open("storage", NVS_READWRITE, &handle);
+   if (err != ESP_OK) {
+       printf("Error opening NVS: %s", esp_err_to_name(err));
+       return err;
+   }
+   err = nvs_set_blob(handle, key, &value, sizeof(float));
+   if (err != ESP_OK) {
+       printf("Error writing float: %s", esp_err_to_name(err));
+       nvs_close(handle);
+       return err;
+   }
+   err = nvs_commit(handle);
+   if (err != ESP_OK) {
+       printf("Error committing: %s", esp_err_to_name(err));
+   }
+   nvs_close(handle);
+   return err;
+}
+
+float nvs_read_float(const char *key, float default_value) {
+   nvs_handle_t handle;
+   esp_err_t err;
+   float value = default_value;
+   err = nvs_open("storage", NVS_READONLY, &handle);
+   if (err != ESP_OK) {
+       printf("Error opening NVS: %s", esp_err_to_name(err));
+       return default_value;
+   }
+   size_t required_size = sizeof(float);
+   err = nvs_get_blob(handle, key, &value, &required_size);
+   if (err == ESP_ERR_NVS_NOT_FOUND) {
+       printf( "Key '%s' not found, using default", key);
+   } else if (err != ESP_OK) {
+       printf( "Error reading float: %s", esp_err_to_name(err));
+   }
+   nvs_close(handle);
+   return value;
+}
 
 static void print_json(cJSON *json)
 {
@@ -169,7 +259,26 @@ static void process_command_json(const char *cmd)
         } else {
             send_response("set_target_temperature", false, "Invalid 'value' field");
         }
-    } else if (strcmp(type_str, "enable_heater") == 0) {
+    }
+    
+    else if (strcmp(type_str, "set_loadcell_zero") == 0) {
+        loadcell_zero = latest_loadcell_raw;
+        nvs_write_integer("zero", loadcell_zero);
+    }
+
+     else if (strcmp(type_str, "set_loadcell_multiplier") == 0) {
+        cJSON *value_item = cJSON_GetObjectItem(json, "value");
+        if (value_item != NULL && value_item->type == cJSON_Number) {
+            float current_force_in_grams = (float)value_item->valuedouble;
+            loadcell_multiplier = current_force_in_grams / (latest_loadcell_raw - loadcell_zero);
+            nvs_write_float("multiplier", loadcell_multiplier);
+            send_response("set_loadcell_multiplier", true, "Force set");
+        } else {
+            send_response("set_loadcell_multiplier", false, "Invalid 'value' field");
+        }
+    }
+    
+    else if (strcmp(type_str, "enable_heater") == 0) {
         cJSON *value_item = cJSON_GetObjectItem(json, "value");
         if (value_item != NULL && value_item->type == cJSON_True) {
             // Check if we have valid temperature data before enabling
@@ -309,7 +418,7 @@ void update_loadcell_state(void *arg)
                 {
                     latest_loadcell_raw = raw;
                     atomic_store(&loadcell_data_valid, true);
-                    print_json(report_loadcell_json(raw));
+                    print_json(report_loadcell_json(raw, loadcell_zero, loadcell_multiplier));
                 }
             }
             gpio_intr_enable(loadcell.drdy_pin);
@@ -407,10 +516,14 @@ static void command_task(void *arg)
     }
 }
 
+
+
+
 static const char *TAG = "main";
 
 void setup()
 {
+    
     pid_init(&pid_c);
     usb_serial_init();
     i2c_bus_mutex = xSemaphoreCreateMutex();
@@ -420,6 +533,9 @@ void setup()
     led_init(&status_led);
     i2c_master_init();
     spi_init();
+
+    loadcell_zero = nvs_read_integer("zero", 0);
+    loadcell_multiplier = nvs_read_float("multiplier", 1.0);
     
     pd_init(&pd_device);
     ina260_init(&power_monitor);
@@ -469,14 +585,28 @@ void setup()
     
     gpio_intr_enable(TEMP_DATA_READY);
     gpio_intr_enable(loadcell.drdy_pin);
+    
+
+
+    // Init NVS
+    esp_err_t err;
+    err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+    nvs_handle_t my_handle;
+
 }
 
 void app_main(void)
 {
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
     setup();
     
     while (1)
-    {
+    {   
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
 }

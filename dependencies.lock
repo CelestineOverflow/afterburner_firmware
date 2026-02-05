@@ -20,7 +20,7 @@ dependencies:
     - esp32s3
     version: 1.0.7
   esp-idf-lib/esp_idf_lib_helpers:
-    component_hash: a8049b1e609679fb54b2d57b0399dd29c4d1fda09a797edac9926f7810aa5703
+    component_hash: 689853bb8993434f9556af0f2816e808bf77b5d22100144b21f3519993daf237
     dependencies: []
     source:
       registry_url: https://components.espressif.com
@@ -36,7 +36,7 @@ dependencies:
     - esp32p4
     - esp32s2
     - esp32s3
-    version: 1.3.10
+    version: 1.4.0
   esp-idf-lib/led_strip_spi:
     component_hash: 1b00579b7ac3ca36948ece9acb9f2a188b51fb4e560020099e9e874613ca6e3e
     dependencies:
@@ -92,11 +92,22 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.5.1
+    version: 5.5.2
+  joltwallet/littlefs:
+    component_hash: dcea25bcef2de023f089f5f01e8d8c46ad1b8ffef75861ad5ffb4098555839df
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.20.4
 direct_dependencies:
 - esp-idf-lib/led_strip_spi
 - espressif/led_strip
 - idf
-manifest_hash: 5cc5b55ac73c5e83179a8adcf04b4ff5a677df78ee95ad2cdf80f7294d1e7a82
+- joltwallet/littlefs
+manifest_hash: 0fec080b3de968105a63ec5d7d6428f134dfd78e92c7ede3ca331510ecd082ce
 target: esp32c6
 version: 2.0.0

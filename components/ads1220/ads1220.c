@@ -240,9 +240,10 @@ esp_err_t ads1220_init(ads1220_t *dev)
     return ESP_OK;
 }
 
-cJSON *report_loadcell_json(int32_t raw)
+cJSON *report_loadcell_json(int32_t raw, int32_t zero, float multiplier)
 {
     cJSON *json = cJSON_CreateObject();
-    cJSON_AddNumberToObject(json, "loadcell", raw);
+    float reading = (raw - zero) * multiplier;
+    cJSON_AddNumberToObject(json, "loadcell", reading);
     return json;
 }
