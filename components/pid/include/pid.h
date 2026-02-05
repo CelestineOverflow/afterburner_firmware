@@ -31,7 +31,7 @@ typedef struct {
 } pid_controller_t;
 
 void pid_init(pid_controller_t *pid);
-void pid_update(pid_controller_t *pid, float setpoint, float measured);
+int pid_update(pid_controller_t *pid, float setpoint, float measured);
 void pid_set_gains(pid_controller_t *pid, float kp, float ki, float kd);
 void pid_reset(pid_controller_t *pid);
 void pid_set_enabled(pid_controller_t *pid, bool enabled);

@@ -277,11 +277,12 @@ void update_temp_state(void *arg)
                         pid_set_enabled(&pid_c, false);
                         report_error_json("Temperature out of range - heater disabled");
                     }
-                    pid_update(&pid_c, target_temperature, current_temperature);
+                    int ret = pid_update(&pid_c, target_temperature, current_temperature);
                     cJSON *json = cJSON_CreateObject();
                     cJSON_AddStringToObject(json, "type", "pid_status");
                     cJSON_AddNumberToObject(json, "target_temperature", target_temperature);
                     cJSON_AddBoolToObject(json, "heater_enabled", pid_c.enabled);
+                    cJSON_AddNumberToObject(json, "pwm_duty", ret);
                     print_json(json);
                 }
             }

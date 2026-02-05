@@ -65,7 +65,7 @@ void pid_init(pid_controller_t *pid) {
     ESP_LOGI(TAG, "PID controller initialized on pin %d", pid->pwm_pin);
 }
 
-void pid_update(pid_controller_t *pid, float setpoint, float measured) {
+int pid_update(pid_controller_t *pid, float setpoint, float measured) {
     // Get current time in microseconds
     int64_t current_time_us = esp_timer_get_time();
     
@@ -83,7 +83,7 @@ void pid_update(pid_controller_t *pid, float setpoint, float measured) {
     
     // If disabled, do nothing more
     if (!pid->enabled) {
-        return;
+        return 0;
     }
     
     // Calculate dt in seconds
@@ -145,8 +145,7 @@ void pid_update(pid_controller_t *pid, float setpoint, float measured) {
     ledc_set_duty(pid->speed_mode, pid->ledc_channel, duty);
     ledc_update_duty(pid->speed_mode, pid->ledc_channel);
     
-    ESP_LOGD(TAG, "PID: SP=%.2f PV=%.2f err=%.2f P=%.2f I=%.2f D=%.2f out=%.2f duty=%lu", 
-             setpoint, measured, error, p_term, i_term, d_term, output, duty);
+    return duty;
 }
 
 void pid_set_gains(pid_controller_t *pid, float kp, float ki, float kd) {
