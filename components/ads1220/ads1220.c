@@ -243,7 +243,10 @@ esp_err_t ads1220_init(ads1220_t *dev)
 cJSON *report_loadcell_json(int32_t raw, int32_t zero, float multiplier)
 {
     cJSON *json = cJSON_CreateObject();
-    float reading = (raw - zero) * multiplier;
-    cJSON_AddNumberToObject(json, "loadcell", reading);
+    cJSON_AddNumberToObject(json, "loadcell", (raw - zero) * multiplier);
+    cJSON_AddNumberToObject(json, "loadcell_raw", (raw));
+    cJSON_AddNumberToObject(json, "loadcell_zero", (zero));
+    cJSON_AddNumberToObject(json, "loadcell_multiplier", (multiplier));
+
     return json;
 }
