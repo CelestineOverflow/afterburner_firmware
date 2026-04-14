@@ -47,25 +47,25 @@
 /*
  * Register 1: Data rate, Mode, Conversion, Temp sensor
  */
-#define ADS1220_DR_20SPS        (0x00 << 5)
-#define ADS1220_DR_45SPS        (0x01 << 5)
-#define ADS1220_DR_90SPS        (0x02 << 5)
-#define ADS1220_DR_175SPS       (0x03 << 5)
-#define ADS1220_DR_330SPS       (0x04 << 5)
-#define ADS1220_DR_600SPS       (0x05 << 5)
-#define ADS1220_DR_1000SPS      (0x06 << 5)
+#define ADS1220_DR_20SPS        (0x00 << 4)
+#define ADS1220_DR_45SPS        (0x00 << 4)
+#define ADS1220_DR_90SPS        (0x00 << 4)
+#define ADS1220_DR_175SPS       (0x00 << 4)
+#define ADS1220_DR_330SPS       (0x00 << 4)
+#define ADS1220_DR_600SPS       (0x00 << 4)
+#define ADS1220_DR_1000SPS      (0x00 << 4)
 
-#define ADS1220_MODE_NORMAL     (0x00 << 4)
-#define ADS1220_MODE_TURBO      (0x01 << 4)
+#define ADS1220_MODE_NORMAL     (0x00 << 3)
+#define ADS1220_MODE_TURBO      (0x01 << 3)
 
-#define ADS1220_CM_SINGLE       (0x00 << 3)
-#define ADS1220_CM_CONTINUOUS   (0x01 << 3)
+#define ADS1220_CM_SINGLE       (0x00 << 2)
+#define ADS1220_CM_CONTINUOUS   (0x01 << 2)
 
-#define ADS1220_TS_DISABLED     (0x00 << 2)
-#define ADS1220_TS_ENABLED      (0x01 << 2)
+#define ADS1220_TS_DISABLED     (0x00 << 1)
+#define ADS1220_TS_ENABLED      (0x01 << 1)
 
-#define ADS1220_BCS_OFF         (0x00 << 1)
-#define ADS1220_BCS_ON          (0x01 << 1)
+#define ADS1220_BCS_OFF         (0x00 << 0)
+#define ADS1220_BCS_ON          (0x01 << 0)
 
 /*
  * Register 2: Voltage reference, FIR filter, Power switch, IDAC
@@ -209,44 +209,22 @@ esp_err_t ads1220_init(ads1220_t *dev)
     ads1220_send_cmd(dev, ADS1220_CMD_RESET);
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    /*
-     * REG0 = 0x36: AIN1 vs AIN2, Gain=8, PGA enabled
-     */
-    ads1220_write_reg(dev, ADS1220_REG0,
-        ADS1220_MUX_AIN1_AIN2 | ADS1220_GAIN_8);
-
-    /*
-     * REG1 = 0x04: 20 SPS, normal mode, single-shot, temp sensor enabled
-     * Note: TS=1 seems odd for load cell but this config works
-     */
-    ads1220_write_reg(dev, ADS1220_REG1,
-        ADS1220_DR_20SPS | ADS1220_MODE_NORMAL | ADS1220_CM_SINGLE | ADS1220_TS_ENABLED);
-
-    /*
-     * REG2 = 0x98: External ref on AIN0/AIN3, 50/60Hz rejection, low-side switch open
-     */
-    ads1220_write_reg(dev, ADS1220_REG2,
-        ADS1220_VREF_AIN0_AIN3 | ADS1220_FIR_50_60 | ADS1220_PSW_OPEN | ADS1220_IDAC_OFF);
-
-    /*
-     * REG3 = 0x00: IDACs disabled, DRDY on dedicated pin
-     */
-    ads1220_write_reg(dev, ADS1220_REG3,
-        ADS1220_I1MUX_DISABLED | ADS1220_I2MUX_DISABLED | ADS1220_DRDY_DEDICATED);
-
+    ads1220_write_reg(dev, ADS1220_REG0, ADS1220_MUX_AIN1_AIN2 | ADS1220_GAIN_8);
+    ads1220_write_reg(dev, ADS1220_REG1, ADS1220_DR_90SPS | ADS1220_MODE_NORMAL | ADS1220_CM_CONTINUOUS | ADS1220_TS_DISABLED);
+    ads1220_write_reg(dev, ADS1220_REG2, ADS1220_VREF_AIN0_AIN3 | ADS1220_FIR_50_60 | ADS1220_PSW_OPEN | ADS1220_IDAC_OFF);
+    ads1220_write_reg(dev, ADS1220_REG3, ADS1220_I1MUX_DISABLED | ADS1220_I2MUX_DISABLED | ADS1220_DRDY_DEDICATED);
     ads1220_send_cmd(dev, ADS1220_CMD_START);
 
     dev->gain = 4;
     return ESP_OK;
 }
 
-cJSON *report_loadcell_json(int32_t raw, int32_t zero, float multiplier)
+cJSON *report_loadcell_json(int32_t raw, float force, int32_t zero, float multiplier)
 {
     cJSON *json = cJSON_CreateObject();
-    cJSON_AddNumberToObject(json, "loadcell", (raw - zero) * multiplier);
     cJSON_AddNumberToObject(json, "loadcell_raw", (raw));
+    cJSON_AddNumberToObject(json, "loadcell_force", force);
     cJSON_AddNumberToObject(json, "loadcell_zero", (zero));
     cJSON_AddNumberToObject(json, "loadcell_multiplier", (multiplier));
-
     return json;
 }

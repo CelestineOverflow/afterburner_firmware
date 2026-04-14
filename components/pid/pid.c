@@ -171,7 +171,7 @@ void pid_set_enabled(pid_controller_t *pid, bool enabled) {
         ledc_update_duty(pid->speed_mode, pid->ledc_channel);
         pid->integral = 0.0f;
         pid->prev_error = 0.0f;
-        ESP_LOGI(TAG, "PID explicitly disabled - heater off");
+        // ESP_LOGI(TAG, "PID explicitly disabled - heater off");
     } else {
         ESP_LOGI(TAG, "PID enabled");
     }

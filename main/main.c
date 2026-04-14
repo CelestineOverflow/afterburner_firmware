@@ -87,6 +87,8 @@ static atomic_bool temp_data_valid = false;
 static QueueHandle_t temp_ready_queue = NULL;
 
 // Loadcell state
+static volatile float currentForce = 0.0f;
+static volatile bool  disable_force_override = true;
 static volatile int32_t latest_loadcell_raw = 0;
 static volatile int32_t loadcell_zero = 0;
 static volatile float loadcell_multiplier = 1.0f;
@@ -136,7 +138,7 @@ int32_t nvs_read_integer(const char *key, int32_t default_value)
 {
     nvs_handle_t handle;
     esp_err_t err;
-    float value = default_value;
+    int32_t value = default_value;
     err = nvs_open("storage", NVS_READONLY, &handle);
     if (err != ESP_OK)
     {
@@ -231,7 +233,13 @@ static void report_error_json(const char *message)
     cJSON *json = cJSON_CreateObject();
     cJSON_AddStringToObject(json, "type", "error");
     cJSON_AddStringToObject(json, "message", message);
-    ;
+    print_json(json);
+}
+
+static void report_warning_json(const char *message){
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "type", "warning");
+    cJSON_AddStringToObject(json, "message", message);
     print_json(json);
 }
 
@@ -360,6 +368,16 @@ static void process_command_json(const char *cmd)
         }
     }
 
+    else if (strcmp(type_str, "override_force") == 0){
+        cJSON *value_item = cJSON_GetObjectItem(json, "value");
+        if (value_item != NULL && value_item->type == cJSON_True){
+            disable_force_override = true;
+        }
+        else if (value_item != NULL && value_item->type == cJSON_False){
+            disable_force_override = false;
+        }
+    }
+
     else if (strcmp(type_str, "enable_heater") == 0)
     {
         cJSON *value_item = cJSON_GetObjectItem(json, "value");
@@ -474,10 +492,15 @@ void update_temp_state(void *arg)
                     atomic_store(&temp_data_valid, true);
                     print_json(report_temperature_json(temp));
                     // if the temperature exceeds target by more than 20c or is out of range disable the heater
-                    if ((pid_c.enabled) && (temp > target_temperature + 20.0f || temp < -200.0f || temp > 200.0f))
+                    if ((pid_c.enabled) && (temp > target_temperature + 20.0f || temp < -200.0f || temp > 200.0f ))
                     {
                         pid_set_enabled(&pid_c, false);
                         report_error_json("Temperature out of range - heater disabled");
+                    }
+                    if ((pid_c.enabled) && (currentForce < 1000.0 && !disable_force_override))
+                    {
+                        pid_set_enabled(&pid_c, false);
+                        report_error_json("Force less than minimun out - heater disabled");
                     }
                     int ret = pid_update(&pid_c, target_temperature, current_temperature);
                     cJSON *json = cJSON_CreateObject();
@@ -485,6 +508,9 @@ void update_temp_state(void *arg)
                     cJSON_AddNumberToObject(json, "target_temperature", target_temperature);
                     cJSON_AddBoolToObject(json, "heater_enabled", pid_c.enabled);
                     cJSON_AddNumberToObject(json, "pwm_duty", ret);
+                    cJSON_AddNumberToObject(json, "kp", pid_c.kp);
+                    cJSON_AddNumberToObject(json, "ki", pid_c.ki);
+                    cJSON_AddNumberToObject(json, "kd", pid_c.kd);
                     print_json(json);
                 }
             }
@@ -510,8 +536,10 @@ void update_loadcell_state(void *arg)
                 if (err == ESP_OK)
                 {
                     latest_loadcell_raw = raw;
+                    currentForce = (raw - loadcell_zero) * loadcell_multiplier;
                     atomic_store(&loadcell_data_valid, true);
-                    print_json(report_loadcell_json(raw, loadcell_zero, loadcell_multiplier));
+                    print_json(report_loadcell_json(raw, currentForce , loadcell_zero, loadcell_multiplier));
+                    // printf("%ld\n", raw);
                 }
             }
             gpio_intr_enable(loadcell.drdy_pin);
@@ -630,7 +658,6 @@ void initNVS()
     pid_c.kp = nvs_read_float("kp", 5.0);
     pid_c.ki = nvs_read_float("ki", 0.1);
     pid_c.kd = nvs_read_float("kd", 2.0);
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
 }
 
 void setup()
@@ -696,9 +723,7 @@ void setup()
 
 void app_main(void)
 {
-    vTaskDelay(2000 / portTICK_PERIOD_MS);
     setup();
-
     while (1)
     {
         vTaskDelay(1000 / portTICK_PERIOD_MS);

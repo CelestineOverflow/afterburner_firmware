@@ -7,7 +7,8 @@
   ],
   "idf.toolsPathWin": "C:\\Users\\celestine\\.espressif",
   "idf.customExtraVars": {
-    "IDF_TARGET": "esp32c6"
+    "IDF_TARGET": "esp32c6",
+    "OPENOCD_USB_ADAPTER_LOCATION": "2-2"
   },
   "idf.flashType": "UART",
   "idf.portWin": "COM7",
