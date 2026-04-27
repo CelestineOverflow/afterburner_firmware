@@ -11,6 +11,6 @@
     "OPENOCD_USB_ADAPTER_LOCATION": "2-2"
   },
   "idf.flashType": "UART",
-  "idf.portWin": "COM7",
+  "idf.portWin": "COM11",
   "idf.currentSetup": "C:\\esp\\v5.5.2\\esp-idf"
 }

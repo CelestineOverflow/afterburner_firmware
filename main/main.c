@@ -66,9 +66,9 @@ pd_t pd_device = {
 };
 
 pid_controller_t pid_c = {
-    .kp = 5.0f,
-    .ki = 0.1f,
-    .kd = 2.0f,
+    .kp = 1000.0f,
+    .ki = 500.0f,
+    .kd = 0.1f,
     .pwm_pin = HEATER_PWM,
     .speed_mode = LEDC_LOW_SPEED_MODE,
     .duty_resolution = LEDC_TIMER_8_BIT,
@@ -77,6 +77,7 @@ pid_controller_t pid_c = {
     .ledc_clk_cfg = LEDC_AUTO_CLK,
     .frequency = 100,
     .max_duty = 255,
+    .integral_max = 1000,
     .enabled = false,
 };
 
@@ -492,7 +493,14 @@ void update_temp_state(void *arg)
                     atomic_store(&temp_data_valid, true);
                     print_json(report_temperature_json(temp));
                     // if the temperature exceeds target by more than 20c or is out of range disable the heater
-                    if ((pid_c.enabled) && (temp > target_temperature + 20.0f || temp < -200.0f || temp > 200.0f ))
+                    // bug here if the temperature of the target is less than the current temperature as in sending a lower temperature thru the gui it will trigger this failsafe
+                    // should we disable the failsafe or make a workaround??
+                    if ((pid_c.enabled) && (temp > target_temperature + 20.0f))
+                    {
+                        pid_set_enabled(&pid_c, false);
+                        report_error_json("Failsafe - Current Temperature exceed target by 20c");
+                    }
+                    if ((pid_c.enabled) && (temp < -300.0f || temp > 300.0f ))
                     {
                         pid_set_enabled(&pid_c, false);
                         report_error_json("Temperature out of range - heater disabled");
@@ -547,6 +555,8 @@ void update_loadcell_state(void *arg)
     }
 }
 
+static int error_counter = 0;
+
 static void update_ina260_state(void *arg)
 {
     TickType_t last_wake_time = xTaskGetTickCount();
@@ -570,6 +580,12 @@ static void update_ina260_state(void *arg)
                 // if the voltage is below 15000 mV we disable the heater
                 if (pid_c.enabled && v < 15000)
                 {
+                    error_counter++;
+                }
+                else{
+                    error_counter = 0;
+                }
+                if(error_counter > 10){
                     pid_set_enabled(&pid_c, false);
                     report_error_json("INA260 voltage low - heater disabled");
                 }
