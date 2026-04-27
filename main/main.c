@@ -414,17 +414,24 @@ static void process_command_json(const char *cmd)
     else if (strcmp(type_str, "get_firmware_version") == 0)
     {
         cJSON *response = cJSON_CreateObject();
-        cJSON_AddStringToObject(response, "type", "version");
+        cJSON_AddStringToObject(response, "type", "firmware_info");
         cJSON_AddStringToObject(response, "version", desc->version);
+        // cJSON_AddStringToObject(response, "git_version", desc->GIT_VERSION);
         cJSON_AddStringToObject(response, "idf_version", desc->idf_ver);
         cJSON_AddStringToObject(response, "build_time", desc->time);
         cJSON_AddStringToObject(response, "build_date", desc->date);
         cJSON_AddStringToObject(response, "project_name", desc->project_name);
+        vTaskDelay(pdMS_TO_TICKS(2000)); // wait for boot logs to finish
         print_json(response);
     }
     else
     {
-        report_error_json("Unknown command type");
+        
+        // report_error_json("Unknown command type");
+        //append cmd to error message for better debugging
+        char error_msg[128];
+        snprintf(error_msg, sizeof(error_msg), "Unknown command type: %s", type_str);
+        report_warning_json(error_msg);
     }
 
     cJSON_Delete(json);
