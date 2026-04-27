@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "esp_app_desc.h"
 // User components
 #include "led_control.h"
 #include "ina260.h"
@@ -27,6 +28,10 @@
 #include "esp_vfs_usb_serial_jtag.h"
 #include "pid.h"
 #include "board.h"
+
+
+const esp_app_desc_t *desc = NULL;
+// ESP_LOGI(TAG, "version: %s", desc->version);
 // #include "esp_littlefs.h"
 
 static SemaphoreHandle_t i2c_bus_mutex = NULL;
@@ -273,6 +278,7 @@ static void process_command_json(const char *cmd)
     // { "type": "set_loadcell_zero"}
     // { "type": "set_loadcell_multiplier", "value": float }
     // { "type": "set_target_temperature", "value": float }
+    // { "type": "get_firmware_version" }
 
     cJSON *type_item = cJSON_GetObjectItem(json, "type");
     if (type_item == NULL || type_item->type != cJSON_String)
@@ -405,6 +411,17 @@ static void process_command_json(const char *cmd)
             send_response("enable_heater", false, "Invalid 'value' field");
         }
     }
+    else if (strcmp(type_str, "get_firmware_version") == 0)
+    {
+        cJSON *response = cJSON_CreateObject();
+        cJSON_AddStringToObject(response, "type", "version");
+        cJSON_AddStringToObject(response, "version", desc->version);
+        cJSON_AddStringToObject(response, "idf_version", desc->idf_ver);
+        cJSON_AddStringToObject(response, "build_time", desc->time);
+        cJSON_AddStringToObject(response, "build_date", desc->date);
+        cJSON_AddStringToObject(response, "project_name", desc->project_name);
+        print_json(response);
+    }
     else
     {
         report_error_json("Unknown command type");
@@ -414,6 +431,13 @@ static void process_command_json(const char *cmd)
 }
 
 // =============================SetupW Functions =================================
+
+
+static void version_info_init(void)
+{
+    desc = esp_app_get_description();
+
+}
 
 static void i2c_master_init(void)
 {
@@ -691,6 +715,7 @@ void setup()
     ina260_init(&power_monitor);
     max31865_init(&rtd);
     ads1220_init(&loadcell);
+    version_info_init();
 
     gpio_config_t temp_io_conf = {
         .pin_bit_mask = (1ULL << TEMP_DATA_READY),
